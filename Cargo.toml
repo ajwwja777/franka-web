@@ -1,0 +1,20 @@
+[package]
+name = "franka-web"
+version = "0.1.0"
+edition = "2021"
+description = "Rust operation console for Franka Research 3 teleoperation, recording, HIL and policy deployment"
+
+[dependencies]
+anyhow = "1.0.102"
+axum = { version = "0.8.9", features = ["json"] }
+base64 = "0.22.1"
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4.6.0", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.8.26"
+tokio = { version = "1.52.1", features = ["full"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
