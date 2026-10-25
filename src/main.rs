@@ -154,7 +154,7 @@ async fn http_healthz_ok(port: u16) -> bool {
         let addr: SocketAddr = format!("127.0.0.1:{}", port_copy).parse().ok()?;
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(600)).ok()?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
-        let _ = stream.write_all(b"GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+        let _ = stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
         let mut buf = [0u8; 128];
         let n = stream.read(&mut buf).ok()?;
         let head = String::from_utf8_lossy(&buf[..n]);
@@ -456,7 +456,7 @@ pub async fn scan_deployment_roots(cfg: &AppConfig, preload_procs: &HashMap<Stri
                 if let Ok(sub_entries) = std::fs::read_dir(&p) {
                     for se in sub_entries.flatten() {
                         let sp = se.path();
-                        if sp.is_dir() && (sp.join("configs").is_dir() || sp.join("checkpoints").is_dir()) {
+                        if sp.is_dir() && sp.join("checkpoints").is_dir() {
                             if !candidate_roots.contains(&sp) {
                                 candidate_roots.push(sp);
                             }
@@ -2026,6 +2026,17 @@ async fn run_server(cfg: AppConfig, host: &str, port: u16) -> Result<()> {
         .await;
 
     let app = build_router(state);
+    if port == 8016 {
+        if let Ok(compat_addr) = format!("{}:8015", host).parse::<SocketAddr>() {
+            if let Ok(compat_listener) = tokio::net::TcpListener::bind(compat_addr).await {
+                let app_clone = app.clone();
+                tracing::info!("Franka Web also listening on compat port http://{}", compat_addr);
+                tokio::spawn(async move {
+                    let _ = axum::serve(compat_listener, app_clone).await;
+                });
+            }
+        }
+    }
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     tracing::info!("Franka Web listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
