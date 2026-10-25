@@ -1,0 +1,11 @@
+/LOCAL_HANDOFF.md
+/target/
+/runtime/
+/outputs/
+/.env
+/.env.*
+!/.env.example
+/configs/local.*
+*.log
+.DS_Store
+Thumbs.db
