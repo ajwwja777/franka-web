@@ -3,283 +3,670 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Franka Web Console · 遥操作采集与策略部署平台</title>
+  <title>Franka Magic — 操作与部署工作台</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-dot"></span>
-      <h1>Franka Web Console</h1>
-      <span class="sub-badge">Rust · Franka Research 3</span>
-    </div>
-    <div class="status-pills">
-      <span id="pill-nuc" class="pill pill-warn">NUC 4242: 检查中</span>
-      <span id="pill-desk" class="pill pill-neutral">Desk 隧道: 检查中</span>
-      <span id="pill-fci" class="pill pill-neutral">FCI/状态: 检查中</span>
-      <span id="pill-sm" class="pill pill-neutral">SpaceMouse: --</span>
-      <span id="pill-cam" class="pill pill-neutral">Orbbec: --</span>
-      <button class="btn btn-sm btn-ghost" onclick="refreshAll(true)">🔄 刷新状态</button>
-    </div>
-  </header>
-
-  <main class="workspace">
-    <!-- 左栏：实时相机观测 + 机械臂状态 + 1. 采集前基本控制 -->
-    <section class="col col-left">
-      <!-- 双相机观测卡片 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>📷 双相机实时观测 (Orbbec)</h2>
-          <div class="header-actions">
-            <span id="cam-status-text" class="muted-text">等待画面…</span>
-            <button class="btn btn-sm" onclick="deviceCommand('camera_snapshot')" title="闲置时抓取一次双相机画面（不会长期占用相机）">📸 抓取相机快照</button>
-          </div>
-        </div>
-        <div class="camera-grid">
-          <div class="cam-box">
-            <div class="cam-title">外部相机 (Exterior · CPC936300041)</div>
-            <img id="img-exterior" src="/api/camera/exterior.jpg" alt="Exterior Camera" />
-          </div>
-          <div class="cam-box">
-            <div class="cam-title">腕部相机 (Wrist · CPC93630001C)</div>
-            <img id="img-wrist" src="/api/camera/wrist.jpg" alt="Wrist Camera" />
-          </div>
+  <div class="workbench-shell">
+    <!-- ==================== 左侧：功能模块导航栏 (cobot-web 风格) ==================== -->
+    <aside class="left-sidebar">
+      <div class="brand-header">
+        <div class="brand-logo">F</div>
+        <div class="brand-meta">
+          <div class="brand-title">Franka Magic</div>
+          <div class="brand-sub">FR3 操作与部署台</div>
         </div>
       </div>
 
-      <!-- 机械臂状态与 GPU 状态卡片 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>🦾 机械臂当前状态 & GPU 显存</h2>
-          <span id="robot-err-banner" class="err-inline"></span>
+      <nav class="module-nav" id="moduleNav">
+        <button class="nav-item active" data-view="console" onclick="switchView('console')">
+          <span class="nav-icon">⬡</span>
+          <span class="nav-label">操作台</span>
+        </button>
+        <button class="nav-item" data-view="record" onclick="switchView('record')">
+          <span class="nav-icon">⏺</span>
+          <span class="nav-label">数据采集</span>
+        </button>
+        <button class="nav-item" data-view="deploy" onclick="switchView('deploy')">
+          <span class="nav-icon">▶</span>
+          <span class="nav-label">部署</span>
+        </button>
+        <button class="nav-item" data-view="diag" onclick="switchView('diag')">
+          <span class="nav-icon"> pulse </span>
+          <span class="nav-label">诊断分析</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+
+      <!-- 底部状态小卡片 (复刻 cobot-web 左侧边栏下部) -->
+      <div class="sidebar-status-card">
+        <div class="sidebar-card-header">
+          <span>最近操作</span>
+          <span class="mini-pill" id="sideLastOpBadge">IDLE</span>
         </div>
-        <div class="state-grid">
-          <div class="state-block">
-            <div class="block-label">7 轴关节角 (deg / rad)</div>
-            <div id="joint-values" class="mono-grid">--</div>
+        <div class="sidebar-card-body" id="sideLastOpText">等待操作指令</div>
+      </div>
+
+      <div class="sidebar-status-card">
+        <div class="sidebar-card-header">
+          <span>设备状态</span>
+          <span class="mini-pill" id="sideDevBadge">探测中</span>
+        </div>
+        <div class="sidebar-card-body">
+          <div id="sideDevText">正在同步机械臂与相机状态...</div>
+          <div class="sidebar-card-foot" id="sideDevTime">--:--:--</div>
+        </div>
+      </div>
+
+      <button class="sidebar-settings-btn" onclick="toggleSettingsModal()">
+        <span>⚙ 设置 (Conda / Desk 凭据)</span>
+      </button>
+    </aside>
+
+    <!-- ==================== 中上部 + 中间主工作区 ==================== -->
+    <main class="main-column">
+      <!-- ==================== 上侧：实时相机观测栏 (实时刷新 + 采集 Hz) ==================== -->
+      <section class="top-camera-dock">
+        <div class="dock-titlebar">
+          <div class="dock-title-left">
+            <span class="dock-icon">📷</span>
+            <span class="dock-title">相机</span>
+            <span class="hz-live-pill" id="camLiveHzPill">实时采集: -- Hz</span>
+            <span class="cam-source-pill" id="camSourceBadge">等待流</span>
           </div>
-          <div class="state-block">
-            <div class="block-label">末端位姿 EE Pose (x, y, z, rx, ry, rz) & 夹爪</div>
-            <div id="ee-values" class="mono-grid">--</div>
-            <div id="gripper-bar-wrap" class="gripper-wrap">
-              <span>夹爪开度: <strong id="gripper-text">--</strong></span>
-              <div class="progress-bar"><div id="gripper-fill" class="progress-fill" style="width:0%"></div></div>
+          <div class="dock-title-actions">
+            <button class="btn btn-xs btn-primary" id="btnToggleCamStream" onclick="toggleCameraStream()">开启实时相机</button>
+            <button class="btn btn-xs" onclick="runDeviceCommand('camera_snapshot')">单帧抓拍</button>
+            <button class="btn btn-xs" onclick="runDeviceCommand('preflight')">五项预检 (--check)</button>
+          </div>
+        </div>
+
+        <div class="camera-strip">
+          <!-- 外部相机 -->
+          <div class="cam-viewport">
+            <div class="cam-top-tag">
+              <span class="dot" id="dotCamExt"></span>
+              <span>外部相机 Exterior</span>
+              <span class="mono" id="camExtId">CPC936300041</span>
+            </div>
+            <img id="imgExterior" src="/api/camera/exterior" alt="Exterior Camera" />
+            <div class="cam-bottom-bar">
+              <span class="cam-bar-name">外部相机 (exterior_image_1_left)</span>
+              <span class="cam-bar-stats mono" id="camExtStats">-- FPS · 424×240 · -- ms</span>
+            </div>
+          </div>
+
+          <!-- 腕部相机 -->
+          <div class="cam-viewport">
+            <div class="cam-top-tag">
+              <span class="dot" id="dotCamWrist"></span>
+              <span>腕部相机 Wrist</span>
+              <span class="mono" id="camWristId">CPC93630001C</span>
+            </div>
+            <img id="imgWrist" src="/api/camera/wrist" alt="Wrist Camera" />
+            <div class="cam-bottom-bar">
+              <span class="cam-bar-name">腕部相机 (wrist_image_left)</span>
+              <span class="cam-bar-stats mono" id="camWristStats">-- FPS · 424×240 · -- ms</span>
             </div>
           </div>
         </div>
-        <div class="gpu-strip" id="gpu-strip"></div>
-      </div>
+      </section>
 
-      <!-- 1. 采集数据前的基本控制 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>1️⃣ 采集/部署前基本控制 (Conda · Desk · FCI · NUC)</h2>
-        </div>
+      <!-- ==================== 中间：具体功能模块操作区 ==================== -->
+      <section class="center-workbench">
+        <!-- 视图 1：操作台 (默认视图，对齐 cobot-web 操作台) -->
+        <div class="workbench-view active" id="view-console">
+          <div class="console-split">
+            <!-- 左半：设备拓扑与采前基本控制 -->
+            <div class="panel-box console-topology-panel">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">链路拓扑与采前基本控制</span>
+                  <span class="panel-box-sub">Conda · Desk 隧道 · Lock/Unlock · FCI · NUC 服务</span>
+                </div>
+                <div class="header-inline-controls">
+                  <select id="condaEnvSelect" class="compact-select" onchange="onCondaSelectChange()"></select>
+                </div>
+              </div>
 
-        <div class="form-row">
-          <label>Conda / Python 环境</label>
-          <div class="input-group">
-            <select id="sel-conda-env" onchange="onCondaSelectChange()"></select>
-            <input id="inp-conda-env" type="text" placeholder="/data2/yjd/.conda/envs/franka" />
-            <button class="btn btn-sm" onclick="saveCondaEnv()">切换/保存</button>
+              <!-- 可视化状态拓扑图 (仿 cobot-web 中间拓扑画布) -->
+              <div class="topology-canvas">
+                <div class="topo-row">
+                  <div class="topo-node" id="topoNodeHost">
+                    <div class="topo-node-badge">HOST</div>
+                    <div class="topo-node-title">Franka 工作站</div>
+                    <div class="topo-node-meta mono" id="topoHostMeta">4×RTX 4090</div>
+                  </div>
+                  <div class="topo-edge" id="topoEdgeDesk"></div>
+                  <div class="topo-node" id="topoNodeDesk">
+                    <div class="topo-node-badge" id="topoBadgeDesk">DESK</div>
+                    <div class="topo-node-title">Desk 隧道 &amp; FCI</div>
+                    <div class="topo-node-meta mono" id="topoDeskMeta">localhost:8443</div>
+                  </div>
+                </div>
+
+                <div class="topo-row">
+                  <div class="topo-node" id="topoNodeNuc">
+                    <div class="topo-node-badge" id="topoBadgeNuc">NUC</div>
+                    <div class="topo-node-title">NUC 实时控制服务</div>
+                    <div class="topo-node-meta mono" id="topoNucMeta">192.168.50.10:4242</div>
+                  </div>
+                  <div class="topo-edge" id="topoEdgeArm"></div>
+                  <div class="topo-node" id="topoNodeArm">
+                    <div class="topo-node-badge" id="topoBadgeArm">FR3</div>
+                    <div class="topo-node-title">Franka 机械臂 &amp; 夹爪</div>
+                    <div class="topo-node-meta mono" id="topoArmMeta">等待连接</div>
+                  </div>
+                </div>
+
+                <div class="topo-row">
+                  <div class="topo-node" id="topoNodeCam">
+                    <div class="topo-node-badge" id="topoBadgeCam">CAM</div>
+                    <div class="topo-node-title">Orbbec 双相机</div>
+                    <div class="topo-node-meta mono" id="topoCamMeta">实时 -- Hz</div>
+                  </div>
+                  <div class="topo-edge active"></div>
+                  <div class="topo-node" id="topoNodeSm">
+                    <div class="topo-node-badge" id="topoBadgeSm">HIL</div>
+                    <div class="topo-node-title">SpaceMouse 六维鼠</div>
+                    <div class="topo-node-meta mono" id="topoSmMeta">遥操作 / HIL 介入</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 采前控制按钮矩阵 -->
+              <div class="control-groups-grid">
+                <div class="control-group-card">
+                  <div class="cg-title">1. Desk 隧道与关节锁 / FCI</div>
+                  <div class="cg-buttons">
+                    <button class="btn btn-primary" onclick="runDeviceCommand('connect')">franka-connect</button>
+                    <button class="btn" onclick="runDeviceCommand('disconnect')">disconnect</button>
+                    <a class="btn btn-accent" href="https://localhost:8443/desk/" target="_blank" rel="noopener">打开 Desk 网页 ↗</a>
+                  </div>
+                  <div class="cg-buttons" style="margin-top:6px;">
+                    <button class="btn btn-success" onclick="runDeskAction('unlock')">一键解锁 + 激活 FCI</button>
+                    <button class="btn" onclick="runDeskAction('activate_fci')">仅激活 FCI</button>
+                    <button class="btn btn-warn" onclick="runDeskAction('lock')">加锁关节 (Lock)</button>
+                  </div>
+                </div>
+
+                <div class="control-group-card">
+                  <div class="cg-title">2. NUC 服务与夹爪控制</div>
+                  <div class="cg-buttons">
+                    <button class="btn btn-primary" onclick="runDeviceCommand('start')">franka-start (启动 NUC)</button>
+                    <button class="btn" onclick="runDeviceCommand('status')">franka-status</button>
+                    <button class="btn btn-danger" onclick="runDeviceCommand('stop')">franka-stop</button>
+                  </div>
+                  <div class="cg-buttons" style="margin-top:6px;">
+                    <button class="btn" onclick="runDeviceCommand('gripper_reinit')">重启夹爪 (gripper-reinit)</button>
+                    <button class="btn" onclick="runDeviceCommand('preflight')">采集前五项预检</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右半：机械臂状态面板 (对齐 cobot-web 右侧机械臂状态卡片) -->
+            <div class="panel-box console-arm-panel">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">机械臂状态</span>
+                  <span class="panel-box-sub" id="armReadLatency">只读 zerorpc 探测</span>
+                </div>
+                <div class="header-inline-controls">
+                  <button class="btn btn-xs" onclick="refreshState(true)">刷新状态</button>
+                  <button class="btn btn-xs btn-warn" onclick="confirmResetRobot()">归位 (franka-reset)</button>
+                </div>
+              </div>
+
+              <div class="arm-summary-cards">
+                <div class="arm-stat-box">
+                  <span class="arm-stat-label">控制器通信</span>
+                  <strong class="arm-stat-val" id="armReadableVal">探测中</strong>
+                </div>
+                <div class="arm-stat-box">
+                  <span class="arm-stat-label">夹爪开合宽度</span>
+                  <strong class="arm-stat-val mono" id="armGripperVal">-- mm</strong>
+                </div>
+                <div class="arm-stat-box">
+                  <span class="arm-stat-label">实时相机频率</span>
+                  <strong class="arm-stat-val mono" id="armCamHzVal">-- Hz</strong>
+                </div>
+              </div>
+
+              <div class="sub-label">7 关节角度 (q0 ~ q6, rad / deg)</div>
+              <div class="joint-grid" id="jointGrid">
+                <div class="joint-cell"><span class="j-name">J0</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J1</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J2</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J3</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J4</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J5</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">J6</span><span class="j-val">--</span></div>
+              </div>
+
+              <div class="sub-label">末端位姿 (EE Pose: x, y, z, rx, ry, rz)</div>
+              <div class="joint-grid ee-grid" id="eeGrid">
+                <div class="joint-cell"><span class="j-name">X</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">Y</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">Z</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">RX</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">RY</span><span class="j-val">--</span></div>
+                <div class="joint-cell"><span class="j-name">RZ</span><span class="j-val">--</span></div>
+              </div>
+            </div>
           </div>
         </div>
 
-        <div class="control-group-title">Franka Desk 隧道 · 关节锁 (Lock/Unlock) · FCI</div>
-        <div class="btn-grid">
-          <button class="btn btn-primary" onclick="deviceCommand('connect')">🔗 Connect Desk 隧道</button>
-          <button class="btn" onclick="deviceCommand('disconnect')">断开 Desk 隧道</button>
-          <a id="desk-link-btn" class="btn btn-accent" href="https://localhost:8443/desk/" target="_blank" rel="noopener">↗ 打开 Desk 网页 (8443)</a>
-          <button class="btn btn-success" onclick="deskAction('unlock')">🔓 Unlock 解锁关节</button>
-          <button class="btn btn-warn" onclick="deskAction('lock')">🔒 Lock 锁定关节</button>
-          <button class="btn btn-primary" onclick="deskAction('fci-on')">🟢 激活 FCI</button>
-          <button class="btn" onclick="deskAction('fci-off')">⚪ 关闭 FCI</button>
+        <!-- 视图 2：数据采集 (录制 + 可选存储路径 + 加载已有录制数据集到网页) -->
+        <div class="workbench-view" id="view-record">
+          <div class="console-split">
+            <!-- 左：发起录制与 Episode 实时控制 -->
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">遥操作数据录制 (`franka-record`)</span>
+                  <span class="panel-box-sub">支持可选存储路径与网页端 Episode 控制</span>
+                </div>
+                <span class="mini-pill" id="recStatusPill">未在录制</span>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-field">
+                  <label>数据集名称 (`repo_id`)</label>
+                  <input type="text" id="recRepoId" value="jiaan/green_block_test" />
+                </div>
+                <div class="form-field">
+                  <label>存储根路径 (`HF_LEROBOT_HOME`，可自由选择)</label>
+                  <input type="text" id="recStorageRoot" value="/data2/yjd/.cache/huggingface/lerobot" />
+                </div>
+              </div>
+
+              <div class="form-field">
+                <label>任务语言指令 (`task.description`)</label>
+                <input type="text" id="recDescription" value="Insert the green rectangular block from the table into the matching hole in the blue pegboard." />
+              </div>
+
+              <div class="form-grid-3">
+                <div class="form-field">
+                  <label>录制条数 (`episodes`)</label>
+                  <input type="number" id="recEpisodes" value="5" min="1" max="500" />
+                </div>
+                <div class="form-field">
+                  <label>目标采集帧率 (`fps`)</label>
+                  <input type="number" id="recFps" value="30" min="5" max="60" />
+                </div>
+                <div class="form-field">
+                  <label>续采模式 (`resume`)</label>
+                  <select id="recResume">
+                    <option value="false">新建数据集</option>
+                    <option value="true">在已有数据集上续采</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-field" id="recResumeDatasetWrap" style="display:none;">
+                <label>续采目标数据集名称 (`resume_dataset`)</label>
+                <input type="text" id="recResumeDataset" placeholder="例如 green_block_20261009_v1" />
+              </div>
+
+              <div class="action-bar">
+                <button class="btn btn-success btn-lg" id="btnStartRecord" onclick="startRecording()">⏺ 点击开始录制</button>
+                <button class="btn btn-primary" onclick="sendRecordControl('save_episode')">→ 保存当前并下一条</button>
+                <button class="btn btn-warn" onclick="sendRecordControl('rerecord_episode')">← 丢弃并重录本条</button>
+                <button class="btn" onclick="sendRecordControl('stop_recording')">Esc 结束并保存</button>
+                <button class="btn btn-danger" onclick="sendRecordControl('kill')">强制终止</button>
+              </div>
+            </div>
+
+            <!-- 右：加载原有录制数据集到网页中预览 / 回放 -->
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">已有录制数据集浏览与网页预览</span>
+                  <span class="panel-box-sub">点击「加载到网页」可查看轨迹图像与关节数据</span>
+                </div>
+                <button class="btn btn-xs" onclick="loadDatasetsList()">刷新列表</button>
+              </div>
+
+              <div class="dataset-table-container">
+                <table class="compact-table">
+                  <thead>
+                    <tr>
+                      <th>数据集 (`repo_id`)</th>
+                      <th>类型</th>
+                      <th>条数 / 帧数</th>
+                      <th>FPS</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="datasetTableBody">
+                    <tr><td colspan="5" class="muted">正在加载数据集列表...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- 网页内数据集详情预览抽屉 -->
+              <div class="dataset-preview-card" id="datasetPreviewBox" style="display:none;">
+                <div class="dp-header">
+                  <strong id="dpTitle">数据集预览</strong>
+                  <div class="dp-controls">
+                    <label class="muted">Episode:</label>
+                    <input type="number" id="dpEpisodeIdx" value="0" min="0" style="width:60px;" onchange="reloadCurrentDatasetPreview()" />
+                    <button class="btn btn-xs btn-primary" onclick="replayCurrentDataset(true)">干跑校验</button>
+                    <button class="btn btn-xs btn-warn" onclick="replayCurrentDataset(false)">真机回放</button>
+                  </div>
+                </div>
+                <div class="dp-meta mono" id="dpMeta"></div>
+                <div class="dp-images" id="dpImages"></div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <details class="sub-details">
-          <summary>⚙️ Desk API 账号密码配置（可选，用于一键 Unlock / FCI）</summary>
-          <div class="form-inline">
-            <input id="desk-user" type="text" placeholder="Desk 用户名 (如 admin)" />
-            <input id="desk-pass" type="password" placeholder="Desk 密码" />
-            <button class="btn btn-sm" onclick="saveDeskAuth()">保存凭据并测试</button>
-          </div>
-        </details>
+        <!-- 视图 3：部署 (预加载进 GPU + 显示 ckpt 位置 + SpaceMouse HIL 打断与录制) -->
+        <div class="workbench-view" id="view-deploy">
+          <div class="console-split">
+            <!-- 左：部署目录、Checkpoint 路径显示、GPU 预热与启动 -->
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">模型部署与 GPU 预加载加速</span>
+                  <span class="panel-box-sub">提前加载模型常驻显存，点击「开始部署」秒级启动</span>
+                </div>
+                <span class="mini-pill" id="gpuPreloadBadge">未预热</span>
+              </div>
 
-        <div class="control-group-title">NUC Polymetis 服务与机械臂操作（调用原有 CLI）</div>
-        <div class="btn-grid">
-          <button class="btn btn-success" onclick="deviceCommand('start')">▶️ Start NUC 服务 (franka-start)</button>
-          <button class="btn btn-danger" onclick="deviceCommand('stop')">⏹️ Stop NUC 服务 (franka-stop)</button>
-          <button class="btn" onclick="deviceCommand('status')">🔍 查看 NUC 状态 (franka-status)</button>
-          <button class="btn btn-accent" onclick="confirmAndReset()">🏠 机械臂回 Home 位 (franka-reset)</button>
-          <button class="btn" onclick="deviceCommand('gripper_reinit')">🤏 重启夹爪 (franka-gripper-reinit)</button>
-          <button class="btn btn-primary" onclick="deviceCommand('preflight')">✅ 采集五项预检 (franka-record --check)</button>
+              <div class="form-field">
+                <label>部署脚本目录 (`deploy_root`)</label>
+                <div class="input-with-btn">
+                  <select id="deployRootSelect" onchange="onDeployRootChange()"></select>
+                  <input type="text" id="customDeployRootInput" placeholder="输入自定义部署目录路径..." />
+                  <button class="btn btn-xs" onclick="addCustomDeployRoot()">添加目录</button>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-field">
+                  <label>部署任务 (`task_id`)</label>
+                  <select id="deployTaskSelect" onchange="onDeployTaskChange()"></select>
+                </div>
+                <div class="form-field">
+                  <label>Checkpoint Step 选择</label>
+                  <select id="deployStepSelect" onchange="onDeployStepChange()"></select>
+                </div>
+              </div>
+
+              <!-- 突出显示 Checkpoint 完整路径与权重状态 -->
+              <div class="ckpt-highlight-box">
+                <div class="ckpt-row">
+                  <span class="ckpt-label">Checkpoint 路径:</span>
+                  <code class="ckpt-path" id="deployCkptPathDisplay">--</code>
+                </div>
+                <div class="ckpt-row">
+                  <span class="ckpt-label">服务分配与状态:</span>
+                  <span class="mono" id="deployServerMetaDisplay">端口: -- | GPU: -- | 权重: --</span>
+                </div>
+              </div>
+
+              <div class="form-grid-2" style="margin-top:8px;">
+                <div class="form-field">
+                  <label>任务 Prompt</label>
+                  <input type="text" id="deployPromptInput" />
+                </div>
+                <div class="form-field">
+                  <label>启动方式</label>
+                  <select id="deployLaunchMode">
+                    <option value="hil_fast">预热秒开 + SpaceMouse HIL 介入支持 (推荐)</option>
+                    <option value="original_script">调用原目录脚本 (scripts/task.sh start)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="action-bar" style="margin-top:10px;">
+                <button class="btn btn-primary" id="btnPreloadGpu" onclick="preloadDeployToGpu()">⚡ 1. 预加载模型进 GPU</button>
+                <button class="btn btn-success btn-lg" id="btnStartDeploy" onclick="startDeployRollout()">▶ 2. 开始部署推理</button>
+                <button class="btn btn-danger" onclick="unloadDeployFromGpu()">卸载 GPU 模型</button>
+              </div>
+            </div>
+
+            <!-- 右：暂停/继续 + SpaceMouse HIL 打断 + 部署实时录制 -->
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">实时干预控制 (暂停 / SpaceMouse HIL / 录制)</span>
+                  <span class="panel-box-sub">移动 SpaceMouse 自动暂停推理并录制 HIL，停止后可自动恢复</span>
+                </div>
+                <span class="mini-pill" id="rolloutModeBadge">IDLE</span>
+              </div>
+
+              <!-- 实时控制大按钮 -->
+              <div class="hil-live-banner" id="hilLiveBanner">
+                <div class="hil-banner-main">
+                  <span class="hil-mode-tag" id="hilModeTag">IDLE</span>
+                  <span id="hilBannerText">当前未运行部署推理（快捷键 `Alt + P` 可随时一键暂停 / 继续推理）</span>
+                </div>
+                <div class="hil-banner-stats mono" id="hilBannerStats">Step: 0 | HIL 帧: 0 | 相机: -- Hz</div>
+              </div>
+
+              <div class="action-bar">
+                <button class="btn btn-warn" onclick="sendDeployControl({action:'toggle_pause'})">⏸ / ▶ 暂停 / 继续推理 (Alt+P)</button>
+                <button class="btn btn-primary" onclick="sendDeployControl({action:'enter_hil'})">✋ 立即切入人工 HIL</button>
+                <button class="btn btn-success" onclick="sendDeployControl({action:'resume'})">▶ 恢复策略推理</button>
+                <button class="btn btn-danger" onclick="sendDeployControl({action:'stop'})">⏹ 停止部署 (保留GPU)</button>
+              </div>
+
+              <hr class="sep" />
+
+              <div class="form-grid-2">
+                <div class="form-field">
+                  <label>SpaceMouse 移动自动打断 (HIL)</label>
+                  <select id="hilEnableSelect" onchange="pushLiveHilConfig()">
+                    <option value="true">开启：推动 SpaceMouse 即暂停策略并接管</option>
+                    <option value="false">关闭：仅通过网页按钮或快捷键暂停</option>
+                  </select>
+                </div>
+                <div class="form-field">
+                  <label>SpaceMouse 停止后恢复方式</label>
+                  <select id="hilAutoResumeSelect" onchange="pushLiveHilConfig()">
+                    <option value="true">自动恢复：松手静止 N 秒后自动继续策略推理</option>
+                    <option value="false">按键/点击恢复：松手后保持暂停，按 Alt+P 或点击按钮继续</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-grid-3">
+                <div class="form-field">
+                  <label>松手自动恢复等待 (秒)</label>
+                  <input type="number" id="hilIdleSecInput" value="1.2" step="0.2" min="0.4" max="10.0" onchange="pushLiveHilConfig()" />
+                </div>
+                <div class="form-field">
+                  <label>SpaceMouse 触发死区</label>
+                  <input type="number" id="hilDeadzoneInput" value="0.15" step="0.02" min="0.05" max="0.8" onchange="pushLiveHilConfig()" />
+                </div>
+                <div class="form-field">
+                  <label>部署前自动回 Home</label>
+                  <select id="deploySkipReset">
+                    <option value="false">是 (先回 Home 再推理)</option>
+                    <option value="true">否 (从当前位姿直接开始)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="form-field">
+                  <label>部署时同步录制选项</label>
+                  <select id="deployRecordMode">
+                    <option value="hil_only">仅自动录制 SpaceMouse HIL 介入片段 (推荐)</option>
+                    <option value="full_and_hil">录制完整推理轨迹 + HIL 介入标注</option>
+                    <option value="none">不保存部署录制数据</option>
+                  </select>
+                </div>
+                <div class="form-field">
+                  <label>部署录制存储路径 (可自由选择)</label>
+                  <input type="text" id="deployRecordDir" value="/data2/yjd/.cache/huggingface/lerobot/hil_recordings" />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 视图 4：诊断分析 (GPU 显存监控 + 采集前预检 + 故障恢复) -->
+        <div class="workbench-view" id="view-diag">
+          <div class="console-split">
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">4 × NVIDIA RTX 4090 显存与负载监控</span>
+                  <span class="panel-box-sub">核对预加载 Policy Server 所在 GPU 显存占用</span>
+                </div>
+                <button class="btn btn-xs" onclick="refreshState(true)">立即刷新</button>
+              </div>
+              <div class="gpu-cards-grid" id="gpuCardsGrid"></div>
+            </div>
+
+            <div class="panel-box">
+              <div class="panel-box-header">
+                <div>
+                  <span class="panel-box-title">一键诊断与快速恢复工具</span>
+                  <span class="panel-box-sub">对齐 `README_CN.md` 常见故障恢复流程</span>
+                </div>
+              </div>
+              <div class="diag-actions-list">
+                <div class="diag-item">
+                  <div>
+                    <strong>采集前五项硬件预检 (`franka-record --check`)</strong>
+                    <div class="muted">检查 NUC 4242、机械臂状态读取、夹爪状态、双 Orbbec 相机图像抓取、SpaceMouse 连接</div>
+                  </div>
+                  <button class="btn btn-primary" onclick="runDeviceCommand('preflight')">运行五项预检</button>
+                </div>
+                <div class="diag-item">
+                  <div>
+                    <strong>夹爪卡死 / 掉了重新初始化 (`franka-gripper-reinit`)</strong>
+                    <div class="muted">仅重启 NUC 上的夹爪驱动节点，无需重启整个 Polymetis 控制器</div>
+                  </div>
+                  <button class="btn" onclick="runDeviceCommand('gripper_reinit')">重启夹爪驱动</button>
+                </div>
+                <div class="diag-item">
+                  <div>
+                    <strong>控制器反射 / 急停恢复流程</strong>
+                    <div class="muted">先解锁 Desk 并激活 FCI，再重新执行 `franka-start`</div>
+                  </div>
+                  <div class="cg-buttons">
+                    <button class="btn btn-success" onclick="runDeskAction('unlock')">1. 解锁+FCI</button>
+                    <button class="btn btn-primary" onclick="runDeviceCommand('start')">2. 重启 NUC</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ==================== 右侧：输出与子系统状态栏 (复刻 cobot-web 右侧栏) ==================== -->
+    <aside class="right-output-dock">
+      <div class="dock-titlebar">
+        <div class="dock-title-left">
+          <span class="dock-icon mono">&gt;_</span>
+          <span class="dock-title">输出</span>
+        </div>
+        <div class="dock-title-actions">
+          <button class="btn btn-xs btn-danger" onclick="stopAllActiveTasks()">■ 停止任务</button>
+          <button class="btn btn-xs" onclick="runDeviceCommand('preflight')">诊断</button>
+          <button class="btn btn-xs" onclick="clearConsoleView()">清屏</button>
         </div>
       </div>
-    </section>
 
-    <!-- 右栏：2. 遥操作录制与数据集加载 + 3. 模型部署 (GPU 预加载 & SpaceMouse HIL 打断录制) -->
-    <section class="col col-right">
-      <!-- 2. 录制功能与已有数据集加载 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>2️⃣ 遥操作数据录制 & 已有录制加载 (`franka-record`)</h2>
-          <span id="record-badge" class="pill pill-neutral">未在录制</span>
+      <div class="output-split-body">
+        <!-- 左列：子系统健康指示灯列表 -->
+        <div class="subsystem-rail">
+          <div class="subsys-item">
+            <span class="dot" id="subDotArm"></span>
+            <span class="subsys-name">机械臂</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotNuc"></span>
+            <span class="subsys-name">NUC服务</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotCam"></span>
+            <span class="subsys-name">双相机</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotDesk"></span>
+            <span class="subsys-name">Desk/FCI</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotSm"></span>
+            <span class="subsys-name">六维鼠</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotRec"></span>
+            <span class="subsys-name">数据采集</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotGpu"></span>
+            <span class="subsys-name">GPU预热</span>
+          </div>
+          <div class="subsys-item">
+            <span class="dot" id="subDotDeploy"></span>
+            <span class="subsys-name">部署推理</span>
+          </div>
         </div>
 
+        <!-- 右列：实时滚动终端输出 -->
+        <div class="terminal-Pane">
+          <div class="terminal-header">
+            <span id="termActiveTitle">Franka Web 实时控制台输出</span>
+            <label class="auto-scroll-label"><input type="checkbox" id="chkAutoScroll" checked /> 自动滚动</label>
+          </div>
+          <pre class="terminal-log" id="logConsole">正在连接 Franka Web 后端...</pre>
+        </div>
+      </div>
+
+      <!-- 底部命令行速查与日志路径 -->
+      <div class="output-footer-box">
+        <div class="output-footer-title">终端命令与日志路径</div>
+        <code class="footer-cmd">./scripts/ui_status.sh  |  ./scripts/ui_up.sh  |  ./scripts/ui_down.sh</code>
+        <div class="footer-path mono" id="footerLogPath">日志目录: runtime/logs/</div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 设置弹窗 (Conda 环境路径 & Desk 免密登录凭据配置) -->
+  <div class="modal-backdrop" id="settingsModal" style="display:none;">
+    <div class="modal-box">
+      <div class="modal-header">
+        <strong>⚙ 环境与 Franka Desk 凭据设置</strong>
+        <button class="btn btn-xs" onclick="toggleSettingsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-field">
+          <label>Conda / Python 环境路径 (`conda_env`)</label>
+          <input type="text" id="cfgCondaEnvInput" value="/data2/yjd/.conda/envs/franka" />
+        </div>
+        <div class="form-field">
+          <label>默认数据存储根目录 (`storage_root`)</label>
+          <input type="text" id="cfgStorageRootInput" value="/data2/yjd/.cache/huggingface/lerobot" />
+        </div>
         <div class="form-grid-2">
-          <div class="form-row">
-            <label>存储根目录 (Storage Root)</label>
-            <input id="rec-storage-root" type="text" placeholder="/data2/yjd/.cache/huggingface/lerobot" />
+          <div class="form-field">
+            <label>Franka Desk 用户名 (可选，用于网页一键 Unlock/FCI)</label>
+            <input type="text" id="deskUser" placeholder="如 admin" />
           </div>
-          <div class="form-row">
-            <label>数据集名称 (`repo_id`)</label>
-            <input id="rec-repo-id" type="text" placeholder="hao/test" />
-          </div>
-        </div>
-
-        <div class="form-row">
-          <label>任务语言指令 (`task.description` / Prompt)</label>
-          <input id="rec-prompt" type="text" placeholder="Insert the green rectangular block from the table into the matching hole in the blue pegboard." />
-        </div>
-
-        <div class="form-grid-3">
-          <div class="form-row">
-            <label>计划录制条数 (`episodes`)</label>
-            <input id="rec-episodes" type="number" value="5" min="1" max="500" />
-          </div>
-          <div class="form-row">
-            <label>采集帧率 (`fps`)</label>
-            <select id="rec-fps">
-              <option value="30">30 FPS (默认)</option>
-              <option value="15">15 FPS</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <label>续录已有数据集 (`resume`)</label>
-            <div class="checkbox-inline">
-              <input id="rec-resume" type="checkbox" />
-              <input id="rec-resume-ds" type="text" placeholder="续录数据集名 (可选)" />
-            </div>
-          </div>
-        </div>
-
-        <div class="btn-grid">
-          <button id="btn-rec-start" class="btn btn-success" onclick="startRecording()">⏺️ 点击开始录制 (Start Record)</button>
-          <button class="btn btn-primary" onclick="recordControl('next')" title="等效于按物理键盘右方向键 → 或 Enter">⏭️ 完成本条 / 下一步 (→)</button>
-          <button class="btn btn-warn" onclick="recordControl('rerecord')" title="等效于按物理键盘左方向键 ←">↩️ 丢弃并重录本条 (←)</button>
-          <button class="btn btn-danger" onclick="recordControl('stop')" title="等效于按物理键盘 Esc 保存并退出">⏹️ 结束录制并保存 (Esc)</button>
-          <button class="btn btn-ghost" onclick="recordControl('kill')">🛑 强制终止</button>
-        </div>
-
-        <!-- 加载已有录制数据集到网页 -->
-        <div class="dataset-browser">
-          <div class="subheader">
-            <span>📂 已有录制数据集列表（点击可加载画面到网页预览 / 续录 / 真机回放）</span>
-            <button class="btn btn-sm" onclick="loadDatasets()">🔄 扫描存储路径</button>
-          </div>
-          <div id="dataset-list" class="dataset-table-wrap">正在加载数据集列表…</div>
-          <div id="dataset-preview-detail" class="preview-detail-box" style="display:none;"></div>
-        </div>
-      </div>
-
-      <!-- 3. 部署功能：GPU 预加载 + HIL SpaceMouse 打断 + 部署录制 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>3️⃣ 模型部署 · GPU 提前预加载 · SpaceMouse HIL 打断与录制</h2>
-          <span id="deploy-mode-badge" class="pill pill-neutral">待机</span>
-        </div>
-
-        <div class="form-grid-2">
-          <div class="form-row">
-            <label>选择部署脚本目录 (`Deployment Root`)</label>
-            <div class="input-group">
-              <select id="dep-root-select" onchange="onDeployRootChange()"></select>
-              <button class="btn btn-sm" onclick="promptAddDeployRoot()" title="手动添加其他部署目录">+ 自定义目录</button>
-            </div>
-          </div>
-          <div class="form-row">
-            <label>选择任务 (`Task`) & Checkpoint Step</label>
-            <div class="input-group">
-              <select id="dep-task-select" onchange="onDeployTaskChange()"></select>
-              <select id="dep-step-select" onchange="onDeployStepChange()"></select>
-            </div>
-          </div>
-        </div>
-
-        <!-- 显示当前 Checkpoint 位置与 GPU 预热状态 -->
-        <div class="ckpt-info-box">
-          <div><strong>📍 Checkpoint 路径:</strong> <code id="dep-ckpt-path">--</code> <span id="dep-ckpt-valid" class="pill pill-sm">--</span></div>
-          <div><strong>🎯 Prompt:</strong> <span id="dep-prompt-text" class="muted-text">--</span></div>
-          <div class="ckpt-meta-row">
-            <span><strong>分配 GPU / 端口:</strong> <code id="dep-gpu-port">--</code></span>
-            <span><strong>GPU 模型服务状态:</strong> <span id="dep-server-status" class="pill pill-neutral">未加载</span></span>
-            <span><strong>启动模式:</strong>
-              <select id="dep-launch-mode" class="select-inline">
-                <option value="hil_fast">⚡ 快速启动 + HIL 打断 + 录制支持 (复用已预热 GPU)</option>
-                <option value="original_script">📜 原版脚本直调 (run_*.sh start)</option>
-              </select>
-            </span>
-          </div>
-        </div>
-
-        <!-- 核心优化：像 Cobot 一样先加载进 GPU，再点击开始秒级部署 -->
-        <div class="btn-grid deploy-main-btns">
-          <button class="btn btn-accent" onclick="preloadDeployToGpu()">⚡ 1. 预加载模型进 GPU (Preload)</button>
-          <button class="btn btn-success" onclick="startDeployment()">🚀 2. 点击开始部署推理 (Start)</button>
-          <button class="btn btn-warn" onclick="controlDeployment('toggle_pause')" title="快捷键: Alt+P">⏯️ 暂停 / 继续推理 (Alt+P)</button>
-          <button class="btn btn-danger" onclick="controlDeployment('stop')">⏹️ 停止本次部署 (保留 GPU)</button>
-          <button class="btn btn-ghost" onclick="unloadDeployFromGpu()">🧹 卸载 GPU 模型</button>
-        </div>
-
-        <!-- HIL 打断与部署录制设置（运行中也可实时切换） -->
-        <div class="hil-panel">
-          <div class="control-group-title">🕹️ HIL (Human-in-the-Loop) SpaceMouse 打断 & 推理录制设置</div>
-          <div class="hil-options-grid">
-            <label class="check-card">
-              <input id="hil-enable" type="checkbox" checked onchange="syncHilOptionsLive()" />
-              <span><strong>移动 SpaceMouse 自动暂停推理并接管录制 HIL</strong><br/><small>部署时推动 SpaceMouse 立即暂停模型输出，切为遥操作并自动记录 HIL 部分</small></span>
-            </label>
-            <label class="check-card">
-              <input id="hil-auto-resume" type="checkbox" checked onchange="syncHilOptionsLive()" />
-              <span><strong>SpaceMouse 停止后自动恢复推理</strong><br/><small>取消勾选则 SpaceMouse 停下后保持暂停，需按『继续推理』或快捷键 <code>Alt+P</code> 恢复</small></span>
-            </label>
-          </div>
-
-          <div class="form-grid-3" style="margin-top:8px;">
-            <div class="form-row">
-              <label>SpaceMouse 静止恢复延迟 (秒)</label>
-              <input id="hil-idle-sec" type="number" step="0.2" value="1.2" min="0.2" max="10.0" onchange="syncHilOptionsLive()" />
-            </div>
-            <div class="form-row">
-              <label>部署时录制模式</label>
-              <select id="hil-record-mode" onchange="syncHilOptionsLive()">
-                <option value="hil_only">仅自动录制 HIL 接管片段 (hil_only)</option>
-                <option value="full_and_hil">录制完整推理 + HIL 全过程 (full_and_hil)</option>
-                <option value="none">不录制 (none)</option>
-              </select>
-            </div>
-            <div class="form-row">
-              <label>部署录制保存目录</label>
-              <input id="hil-record-dir" type="text" placeholder="/data2/yjd/.cache/huggingface/lerobot/hil_recordings" />
-            </div>
-          </div>
-
-          <div id="rollout-live-banner" class="rollout-status-bar">
-            当前无活动推理进程。可先点击『1. 预加载模型进 GPU』，就绪后点击『2. 点击开始部署推理』。
+          <div class="form-field">
+            <label>Franka Desk 密码 (仅保存在本机 runtime，不入 Git)</label>
+            <input type="password" id="deskPass" placeholder="Desk 登录密码" />
           </div>
         </div>
       </div>
-
-      <!-- 实时任务日志与诊断栏 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>🖥️ 实时输出日志与命令回执</h2>
-          <button class="btn btn-sm btn-ghost" onclick="clearLogView()">清屏</button>
-        </div>
-        <pre id="log-console" class="log-console">正在连接后端服务…</pre>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="saveSettingsModal()">保存配置</button>
+        <button class="btn" onclick="toggleSettingsModal()">关闭</button>
       </div>
-    </section>
-  </main>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>

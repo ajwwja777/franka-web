@@ -4,16 +4,18 @@ Franka Web Bridge Helper
 Provides:
 1. robot-state: Read-only probe of NUC zerorpc (joint positions, ee pose, gripper), USB devices, Desk tunnel.
 2. desk-action: Franka Desk REST API helper for lock/unlock brakes and FCI activation.
-3. camera-snapshot: Grab a read-only dual-camera snapshot when no recording/rollout is active.
-4. dataset-preview: Load an existing LeRobot dataset episode for web visualization (frames + state/action summary).
-5. record-wrapper: Run Franka-Teleop recording with custom storage path, live web camera preview, and web button controls.
-6. hil-rollout: Fast deployment runner reusing preloaded GPU Policy Server, with Pause/Resume, SpaceMouse HIL interrupt, and HIL/rollout recording.
+3. camera-snapshot: Grab a single read-only dual-camera snapshot.
+4. camera-stream: Continuous read-only dual-camera live stream with real-time Hz & latency measurement.
+5. dataset-preview: Load an existing LeRobot dataset episode for web visualization (frames + state/action summary).
+6. record-wrapper: Run Franka-Teleop recording with custom storage path, live web camera preview + real-time capture Hz, and web button controls.
+7. hil-rollout: Fast deployment runner reusing preloaded GPU Policy Server, with Pause/Resume, SpaceMouse HIL interrupt, and HIL/rollout recording.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import datetime as dt
 import json
 import math
@@ -39,7 +41,7 @@ def _port_open(host: str, port: int, timeout: float = 1.5) -> bool:
         return False
 
 
-def _save_jpeg(path: pathlib.Path, rgb_array: Any, quality: int = 82) -> None:
+def _save_jpeg(path: pathlib.Path, rgb_array: Any, quality: int = 80) -> None:
     try:
         from PIL import Image
         import numpy as np
@@ -54,13 +56,23 @@ def _save_jpeg(path: pathlib.Path, rgb_array: Any, quality: int = 82) -> None:
         pass
 
 
+def _write_preview_meta(preview_dir: pathlib.Path, meta: dict[str, Any]) -> None:
+    try:
+        tmp = preview_dir / "meta.tmp.json"
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(preview_dir / "meta.json")
+    except Exception:
+        pass
+
+
 def cmd_robot_state(args: argparse.Namespace) -> int:
     nuc_ip = args.nuc_ip
     nuc_port = args.nuc_port
     desk_port = args.desk_port
 
-    nuc_online = _port_open(nuc_ip, nuc_port, timeout=1.5)
-    desk_tunnel_online = _port_open("127.0.0.1", desk_port, timeout=0.8)
+    t0 = time.perf_counter()
+    nuc_online = _port_open(nuc_ip, nuc_port, timeout=1.2)
+    desk_tunnel_online = _port_open("127.0.0.1", desk_port, timeout=0.6)
 
     usb_out = ""
     try:
@@ -86,6 +98,7 @@ def cmd_robot_state(args: argparse.Namespace) -> int:
         "ee_pose": None,
         "gripper_width_m": None,
         "gripper_norm": None,
+        "probe_ms": round((time.perf_counter() - t0) * 1000.0, 1),
         "error": None,
     }
 
@@ -130,12 +143,13 @@ def cmd_robot_state(args: argparse.Namespace) -> int:
     except Exception as exc:
         result["error"] = f"读取机械臂状态失败（请检查 Desk 解锁与 FCI 是否开启）: {exc}"
 
+    result["probe_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 class _DeskClient:
-    """Minimal Franka Desk REST API client (works via localhost:8443 tunnel or direct 172.16.0.2)."""
+    """Minimal Franka Desk REST API client."""
 
     def __init__(self, base_url: str, username: str = "", password: str = ""):
         self.base_url = base_url.rstrip("/")
@@ -249,7 +263,7 @@ def cmd_desk_action(args: argparse.Namespace) -> int:
         msg = (
             f"Desk 操作 `{action}` 成功 (HTTP {code})"
             if ok
-            else f"Desk API 返回 HTTP {code}（若需网页授权或首次确认，请在 https://localhost:{desk_port}/desk/ 操作或配置 Desk 账号密码）: {body[:200]}"
+            else f"Desk API 返回 HTTP {code}（若需首次确认，请在 https://localhost:{desk_port}/desk/ 操作或配置 Desk 账号密码）: {body[:160]}"
         )
         print(
             json.dumps(
@@ -270,7 +284,7 @@ def cmd_desk_action(args: argparse.Namespace) -> int:
                 {
                     "ok": False,
                     "action": action,
-                    "message": f"调用 Franka Desk 接口异常: {exc}。可直接在浏览器打开 https://localhost:{desk_port}/desk/ 操作。",
+                    "message": f"调用 Franka Desk 接口异常: {exc}。可直接在 https://localhost:{desk_port}/desk/ 操作。",
                     "desk_url": f"https://localhost:{desk_port}/desk/",
                 },
                 ensure_ascii=False,
@@ -297,6 +311,8 @@ def cmd_camera_snapshot(args: argparse.Namespace) -> int:
         cam_cfgs = create_camera_configs(rcfg)
         cameras = make_cameras_from_configs(cam_cfgs)
         connected = []
+        ext_ms = 0.0
+        wrist_ms = 0.0
         try:
             for name, cam in cameras.items():
                 cam.connect()
@@ -304,7 +320,13 @@ def cmd_camera_snapshot(args: argparse.Namespace) -> int:
             time.sleep(0.15)
             for key, out_name in (("exterior_image", "exterior.jpg"), ("wrist_image", "wrist.jpg")):
                 if key in cameras:
+                    t0 = time.perf_counter()
                     frame = cameras[key].async_read(timeout_ms=500)
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    if key == "exterior_image":
+                        ext_ms = round(dt_ms, 1)
+                    else:
+                        wrist_ms = round(dt_ms, 1)
                     _save_jpeg(preview_dir / out_name, frame)
         finally:
             for cam in reversed(connected):
@@ -314,14 +336,141 @@ def cmd_camera_snapshot(args: argparse.Namespace) -> int:
                     pass
         meta = {
             "updated_at": time.time(),
+            "frame_seq": int(time.time() * 10) % 100000,
             "source": "camera_snapshot",
+            "mode": "snapshot",
+            "capture_hz": float(rcfg.fps),
+            "target_fps": int(rcfg.fps),
+            "width": int(rcfg.width),
+            "height": int(rcfg.height),
+            "exterior_ms": ext_ms,
+            "wrist_ms": wrist_ms,
             "message": "已抓取实时双相机快照",
         }
-        (preview_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        _write_preview_meta(preview_dir, meta)
         print(json.dumps({"ok": True, **meta}, ensure_ascii=False))
         return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+
+
+def cmd_camera_stream(args: argparse.Namespace) -> int:
+    """
+    Continuous read-only camera preview stream when no recording/rollout is active.
+    Reads at hardware FPS (e.g. 30Hz) to measure real camera capture Hz, and writes JPEG preview frames at ~8Hz.
+    Automatically exits on SIGTERM/SIGINT so recording/deployment can take over cameras immediately.
+    """
+    preview_dir = pathlib.Path(args.preview_dir)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    teleop_root = pathlib.Path(args.teleop_root)
+    sys.path.insert(0, str(teleop_root))
+
+    stop_flag = False
+
+    def _handle_sig(_signum: int, _frame: Any) -> None:
+        nonlocal stop_flag
+        stop_flag = True
+
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    try:
+        try:
+            import pyorbbecsdk as ob
+
+            ob.Context().set_logger_level(ob.OBLogLevel.ERROR)
+        except Exception:
+            pass
+
+        import yaml
+        from scripts.core.record import RecordConfig, create_camera_configs
+        from lerobot.cameras import make_cameras_from_configs
+
+        cfg_path = teleop_root / "scripts" / "config" / "record_config.yaml"
+        raw_cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        rcfg = RecordConfig(raw_cfg["record"])
+        target_fps = int(rcfg.fps) if int(rcfg.fps) > 0 else 30
+        cam_cfgs = create_camera_configs(rcfg)
+        cameras = make_cameras_from_configs(cam_cfgs)
+
+        connected = []
+        try:
+            for name, cam in cameras.items():
+                cam.connect()
+                connected.append(cam)
+            print(
+                f"[CAM-STREAM] 双相机实时流已启动 ({rcfg.width}×{rcfg.height} @ 目标 {target_fps}Hz)",
+                flush=True,
+            )
+
+            obs_times: collections.deque[float] = collections.deque(maxlen=45)
+            frame_seq = 0
+            last_jpeg_write = 0.0
+            jpeg_interval = 1.0 / max(1.0, float(args.preview_fps))
+
+            while not stop_flag:
+                loop_t0 = time.perf_counter()
+                ext_frame = None
+                wrist_frame = None
+                ext_ms = 0.0
+                wrist_ms = 0.0
+
+                if "exterior_image" in cameras:
+                    t_c = time.perf_counter()
+                    ext_frame = cameras["exterior_image"].async_read(timeout_ms=250)
+                    ext_ms = round((time.perf_counter() - t_c) * 1000.0, 1)
+                if "wrist_image" in cameras:
+                    t_c = time.perf_counter()
+                    wrist_frame = cameras["wrist_image"].async_read(timeout_ms=250)
+                    wrist_ms = round((time.perf_counter() - t_c) * 1000.0, 1)
+
+                now_mono = time.perf_counter()
+                obs_times.append(now_mono)
+                actual_hz = 0.0
+                if len(obs_times) >= 2 and (obs_times[-1] - obs_times[0]) > 1e-6:
+                    actual_hz = round((len(obs_times) - 1) / (obs_times[-1] - obs_times[0]), 1)
+
+                if now_mono - last_jpeg_write >= jpeg_interval:
+                    last_jpeg_write = now_mono
+                    frame_seq += 1
+                    if ext_frame is not None:
+                        _save_jpeg(preview_dir / "exterior.jpg", ext_frame)
+                    if wrist_frame is not None:
+                        _save_jpeg(preview_dir / "wrist.jpg", wrist_frame)
+                    _write_preview_meta(
+                        preview_dir,
+                        {
+                            "updated_at": time.time(),
+                            "frame_seq": frame_seq,
+                            "source": "live_stream",
+                            "mode": "live_stream",
+                            "capture_hz": actual_hz,
+                            "target_fps": target_fps,
+                            "width": int(rcfg.width),
+                            "height": int(rcfg.height),
+                            "exterior_ms": ext_ms,
+                            "wrist_ms": wrist_ms,
+                            "exterior_id": str(rcfg.exterior_cam_id or "CPC936300041"),
+                            "wrist_id": str(rcfg.wrist_cam_id or "CPC93630001C"),
+                            "message": f"实时相机流 · 采集频率 {actual_hz:.1f} Hz",
+                        },
+                    )
+
+                elapsed = time.perf_counter() - loop_t0
+                sleep_s = max(0.0, (1.0 / target_fps) - elapsed)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+        finally:
+            for cam in reversed(connected):
+                try:
+                    cam.disconnect()
+                except Exception:
+                    pass
+            print("[CAM-STREAM] 双相机实时流已安全释放相机句柄", flush=True)
+        return 0
+    except Exception as exc:
+        print(f"[CAM-STREAM] 相机流异常退出: {exc}", file=sys.stderr, flush=True)
         return 1
 
 
@@ -408,12 +557,23 @@ def cmd_dataset_episode_preview(args: argparse.Namespace) -> int:
         summary["video_note"] = str(exc)
 
     if summary["extracted_frames"]:
-        meta = {
-            "updated_at": time.time(),
-            "source": f"dataset:{ds_dir.name}#ep{ep_idx}",
-            "message": f"已加载数据集 {ds_dir.name} 第 {ep_idx} 条样本画面（共 {summary['frame_count']} 帧）",
-        }
-        (preview_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        fps_val = float(info.get("fps", 30))
+        _write_preview_meta(
+            preview_dir,
+            {
+                "updated_at": time.time(),
+                "frame_seq": int(time.time() * 10) % 100000,
+                "source": f"dataset:{ds_dir.name}#ep{ep_idx}",
+                "mode": "dataset_preview",
+                "capture_hz": fps_val,
+                "target_fps": int(fps_val),
+                "width": 424,
+                "height": 240,
+                "exterior_ms": 0.0,
+                "wrist_ms": 0.0,
+                "message": f"数据集预览: {ds_dir.name} #ep{ep_idx} ({summary['frame_count']} 帧)",
+            },
+        )
 
     print(json.dumps(summary, ensure_ascii=False))
     return 0
@@ -423,7 +583,7 @@ def cmd_record_wrapper(args: argparse.Namespace) -> int:
     """
     Wrap Franka-Teleop's record.py so that:
     1. Storage root (HF_LEROBOT_HOME) and YAML config are customized from web UI.
-    2. Live frames during recording are saved to runtime/preview/{exterior,wrist}.jpg at ~4Hz.
+    2. Live frames and real-time observation Hz during recording are saved to runtime/preview/.
     3. Web control commands (save_episode, rerecord_episode, stop_recording) via runtime/record_cmd.json
        trigger the exact same events dictionary as physical keyboard arrows!
     """
@@ -485,31 +645,53 @@ def cmd_record_wrapper(args: argparse.Namespace) -> int:
     rec_mod.init_record_keyboard_listener = patched_init_kb
 
     orig_run_record_loop = rp_mod.run_record_loop
+    obs_window: collections.deque[float] = collections.deque(maxlen=45)
+    frame_seq_box = [0]
 
     def patched_run_record_loop(backend, *, preview_fps=10, clock=None, **kwargs):
         robot = kwargs.get("robot")
+        target_fps = int(kwargs.get("fps", 30))
         last_web_img = [0.0]
         if robot is not None and hasattr(robot, "get_observation"):
             orig_get_obs = robot.get_observation
 
             def obs_with_web_preview(*a, **kw):
+                t_start = time.perf_counter()
                 obs = orig_get_obs(*a, **kw)
-                now = time.monotonic()
-                if now - last_web_img[0] >= 0.25 and isinstance(obs, dict):
-                    last_web_img[0] = now
+                t_end = time.perf_counter()
+                obs_ms = round((t_end - t_start) * 1000.0, 1)
+                obs_window.append(t_end)
+                actual_hz = 0.0
+                if len(obs_window) >= 2 and (obs_window[-1] - obs_window[0]) > 1e-6:
+                    actual_hz = round((len(obs_window) - 1) / (obs_window[-1] - obs_window[0]), 1)
+
+                if t_end - last_web_img[0] >= 0.12 and isinstance(obs, dict):
+                    last_web_img[0] = t_end
+                    frame_seq_box[0] += 1
+                    w, h = 424, 240
                     if "exterior_image" in obs:
-                        _save_jpeg(preview_dir / "exterior.jpg", obs["exterior_image"])
+                        ext = obs["exterior_image"]
+                        if hasattr(ext, "shape") and len(ext.shape) >= 2:
+                            h, w = int(ext.shape[0]), int(ext.shape[1])
+                        _save_jpeg(preview_dir / "exterior.jpg", ext)
                     if "wrist_image" in obs:
                         _save_jpeg(preview_dir / "wrist.jpg", obs["wrist_image"])
-                    meta = {
-                        "updated_at": time.time(),
-                        "source": "franka-record",
-                        "message": "遥操作录制进行中 (实时画面)",
-                    }
-                    try:
-                        (preview_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-                    except Exception:
-                        pass
+                    _write_preview_meta(
+                        preview_dir,
+                        {
+                            "updated_at": time.time(),
+                            "frame_seq": frame_seq_box[0],
+                            "source": "franka-record",
+                            "mode": "recording",
+                            "capture_hz": actual_hz,
+                            "target_fps": target_fps,
+                            "width": w,
+                            "height": h,
+                            "exterior_ms": obs_ms,
+                            "wrist_ms": obs_ms,
+                            "message": f"正在录制 · 实时采集频率 {actual_hz:.1f} Hz (目标 {target_fps} Hz)",
+                        },
+                    )
                 return obs
 
             robot.get_observation = obs_with_web_preview
@@ -536,13 +718,10 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
     """
     Enhanced Policy Deployment Rollout Runner:
     - Connects to an already-warm Policy Server on 127.0.0.1:<port> (instant startup!)
-    - Supports live Pause / Resume via web button or hotkey (`runtime/deploy_control.json`)
-    - Supports SpaceMouse HIL (Human-in-the-Loop) auto-interruption:
-      Moving SpaceMouse beyond deadzone (or pressing gripper buttons) pauses policy inference
-      and switches to SpaceMouse control while recording HIL steps!
-      When SpaceMouse returns to rest for `idle_resume_sec`, optionally auto-resumes policy inference
-      (or waits for manual Resume button if auto_resume is off).
-    - Supports recording deployment trajectories (`none` | `hil_only` | `full_and_hil`) to chosen path.
+    - Real-time camera preview + live capture/control Hz display
+    - Live Pause / Resume via web button or hotkey (`runtime/deploy_control.json`)
+    - SpaceMouse HIL auto-interruption & optional auto-resume
+    - Recording deployment trajectories (`none` | `hil_only` | `full_and_hil`)
     """
     deploy_root = pathlib.Path(args.deploy_root).resolve()
     teleop_root = pathlib.Path(args.teleop_root).resolve()
@@ -565,6 +744,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
         "step": 0,
         "hil_steps": 0,
         "policy_steps": 0,
+        "capture_hz": 0.0,
         "hil_enabled": bool(args.enable_hil),
         "auto_resume": bool(args.auto_resume),
         "idle_resume_sec": float(args.idle_resume_sec),
@@ -700,9 +880,11 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
         last_spacemouse_active_t = 0.0
         manual_paused = False
         last_preview_t = 0.0
+        obs_times: collections.deque[float] = collections.deque(maxlen=45)
+        frame_seq = 0
 
         while not stop_flag:
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
 
             if control_file.is_file():
                 try:
@@ -736,30 +918,40 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
+            obs_t0 = time.perf_counter()
             obs = robot.get_observation()
+            obs_ms = round((time.perf_counter() - obs_t0) * 1000.0, 1)
+            obs_times.append(time.perf_counter())
+            actual_hz = 0.0
+            if len(obs_times) >= 2 and (obs_times[-1] - obs_times[0]) > 1e-6:
+                actual_hz = round((len(obs_times) - 1) / (obs_times[-1] - obs_times[0]), 1)
+            state_doc["capture_hz"] = actual_hz
+
             ext_img = obs["exterior_image"]
             wrist_img = obs["wrist_image"]
 
-            if t0 - last_preview_t >= 0.25:
+            if t0 - last_preview_t >= 0.12:
                 last_preview_t = t0
+                frame_seq += 1
                 _save_jpeg(preview_dir / "exterior.jpg", ext_img)
                 _save_jpeg(preview_dir / "wrist.jpg", wrist_img)
-                try:
-                    (preview_dir / "meta.json").write_text(
-                        json.dumps(
-                            {
-                                "updated_at": time.time(),
-                                "source": f"deploy:{args.task}",
-                                "mode": state_doc["mode"],
-                                "step": state_doc["step"],
-                                "message": f"部署运行中 · 模式: {state_doc['mode'].upper()} · 步数: {state_doc['step']}",
-                            },
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
+                _write_preview_meta(
+                    preview_dir,
+                    {
+                        "updated_at": time.time(),
+                        "frame_seq": frame_seq,
+                        "source": f"deploy:{args.task}",
+                        "mode": state_doc["mode"],
+                        "step": state_doc["step"],
+                        "capture_hz": actual_hz,
+                        "target_fps": fps,
+                        "width": cam_width,
+                        "height": cam_height,
+                        "exterior_ms": obs_ms,
+                        "wrist_ms": obs_ms,
+                        "message": f"部署运行中 ({state_doc['mode'].upper()}) · 频率 {actual_hz:.1f} Hz · 步数 {state_doc['step']}",
+                    },
+                )
 
             sm_active = False
             sm_action_dict: dict[str, float] | None = None
@@ -809,8 +1001,8 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
             executed_action: list[float] | None = None
 
             if active_mode == "paused":
-                publish_state(message="⏸ 已暂停推理（移动 SpaceMouse 可接管，或点击『继续推理』恢复）")
-                time.sleep(0.05)
+                publish_state(message=f"⏸ 已暂停推理 · 实时相机 {actual_hz:.1f} Hz（移动 SpaceMouse 可接管，或点击『继续推理』恢复）")
+                time.sleep(0.04)
                 continue
 
             elif active_mode == "hil" and sm_action_dict is not None:
@@ -820,7 +1012,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                     for ax in ("x", "y", "z", "rx", "ry", "rz")
                 ] + [float(sm_action_dict.get("gripper_cmd_bin", obs["gripper_cmd_bin"]))]
                 state_doc["hil_steps"] += 1
-                publish_state(message=f"🕹️ HIL 人工接管录制中 (已录 HIL {state_doc['hil_steps']} 步)")
+                publish_state(message=f"🕹️ HIL 人工接管录制中 ({actual_hz:.1f} Hz · 已录 HIL {state_doc['hil_steps']} 步)")
 
             elif active_mode == "policy":
                 if chunk is None or chunk_idx >= open_loop_horizon:
@@ -848,7 +1040,9 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                 robot.send_action(action_dict)
                 executed_action = [float(x) for x in act_7d[:6]] + [action_dict["gripper_cmd_bin"]]
                 state_doc["policy_steps"] += 1
-                publish_state(message=f"🤖 模型自动推理中 (Policy {state_doc['policy_steps']} 步 | HIL {state_doc['hil_steps']} 步)")
+                publish_state(
+                    message=f"🤖 模型自动推理中 ({actual_hz:.1f} Hz · Policy {state_doc['policy_steps']} 步 | HIL {state_doc['hil_steps']} 步)"
+                )
 
             step_num = state_doc["step"]
             should_record = (
@@ -868,6 +1062,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                             "step": step_num,
                             "timestamp": time.time(),
                             "source": active_mode,
+                            "capture_hz": actual_hz,
                             "state": state_vec,
                             "action": executed_action,
                         },
@@ -878,7 +1073,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                 rec_steps_file.flush()
 
             state_doc["step"] = step_num + 1
-            elapsed = time.monotonic() - t0
+            elapsed = time.perf_counter() - t0
             sleep_s = max(0.0, (1.0 / fps) - elapsed)
             if sleep_s > 0:
                 time.sleep(sleep_s)
@@ -927,6 +1122,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_snap = sub.add_parser("camera-snapshot")
     p_snap.add_argument("--teleop-root", default="/data2/yjd/workspace/Franka-Teleop")
     p_snap.add_argument("--preview-dir", required=True)
+
+    p_stream = sub.add_parser("camera-stream")
+    p_stream.add_argument("--teleop-root", default="/data2/yjd/workspace/Franka-Teleop")
+    p_stream.add_argument("--preview-dir", required=True)
+    p_stream.add_argument("--preview-fps", type=float, default=8.0)
 
     p_ds = sub.add_parser("dataset-preview")
     p_ds.add_argument("--dataset-dir", required=True)
@@ -977,6 +1177,8 @@ def main() -> int:
         return cmd_desk_action(args)
     if args.subcmd == "camera-snapshot":
         return cmd_camera_snapshot(args)
+    if args.subcmd == "camera-stream":
+        return cmd_camera_stream(args)
     if args.subcmd == "dataset-preview":
         return cmd_dataset_episode_preview(args)
     if args.subcmd == "record-wrapper":

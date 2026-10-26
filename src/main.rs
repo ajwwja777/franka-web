@@ -95,6 +95,7 @@ pub struct AppState {
     pub logs: Mutex<VecDeque<String>>,
     pub record_proc: Mutex<Option<ManagedProcessInfo>>,
     pub rollout_proc: Mutex<Option<ManagedProcessInfo>>,
+    pub camera_stream_proc: Mutex<Option<ManagedProcessInfo>>,
     pub preload_procs: Mutex<HashMap<String, ManagedProcessInfo>>,
     pub cached_robot_state: Mutex<(f64, Value)>,
 }
@@ -714,7 +715,7 @@ pub fn scan_datasets_sync(storage_root: &Path) -> Vec<Value> {
     datasets
 }
 
-fn find_latest_camera_images(cfg: &AppConfig) -> Value {
+fn find_latest_camera_images(cfg: &AppConfig, stream_pid: Option<u32>) -> Value {
     let ext_preview = cfg.preview_dir.join("exterior.jpg");
     let wrist_preview = cfg.preview_dir.join("wrist.jpg");
     let meta_preview = cfg.preview_dir.join("meta.json");
@@ -723,7 +724,17 @@ fn find_latest_camera_images(cfg: &AppConfig) -> Value {
     let mut best_wrist: Option<PathBuf> = None;
     let mut best_mtime: f64 = 0.0;
     let mut source = String::from("none");
-    let mut message = String::from("暂无相机画面（点击『抓取相机快照』或在录制/部署时自动实时显示）");
+    let mut message = String::from("暂无相机画面（点击『开启实时相机』或在录制/部署时自动实时刷新）");
+    let mut capture_hz: f64 = 0.0;
+    let mut target_fps: i64 = 30;
+    let mut width: i64 = 424;
+    let mut height: i64 = 240;
+    let mut exterior_id = String::from("CPC936300041");
+    let mut wrist_id = String::from("CPC93630001C");
+    let mut exterior_ms: f64 = 0.0;
+    let mut wrist_ms: f64 = 0.0;
+    let mut frame_seq: i64 = 0;
+    let mut mode = String::from("IDLE");
 
     if ext_preview.is_file() && wrist_preview.is_file() {
         if let Ok(m) = std::fs::metadata(&ext_preview).and_then(|m| m.modified()) {
@@ -739,6 +750,41 @@ fn find_latest_camera_images(cfg: &AppConfig) -> Value {
                         }
                         if let Some(msg) = v["message"].as_str() {
                             message = msg.to_string();
+                        }
+                        if let Some(hz) = v["capture_hz"].as_f64() {
+                            capture_hz = hz;
+                        }
+                        if let Some(tf) = v["target_fps"].as_i64() {
+                            target_fps = tf;
+                        }
+                        if let Some(w) = v["width"].as_i64() {
+                            width = w;
+                        }
+                        if let Some(h) = v["height"].as_i64() {
+                            height = h;
+                        }
+                        if let Some(eid) = v["exterior_id"].as_str() {
+                            exterior_id = eid.to_string();
+                        }
+                        if let Some(wid) = v["wrist_id"].as_str() {
+                            wrist_id = wid.to_string();
+                        }
+                        if let Some(ems) = v["exterior_ms"].as_f64() {
+                            exterior_ms = ems;
+                        }
+                        if let Some(wms) = v["wrist_ms"].as_f64() {
+                            wrist_ms = wms;
+                        }
+                        if let Some(seq) = v["frame_seq"].as_i64() {
+                            frame_seq = seq;
+                        }
+                        if let Some(md) = v["mode"].as_str() {
+                            mode = md.to_string();
+                        }
+                        if let Some(ts) = v["ts"].as_f64() {
+                            if ts > best_mtime {
+                                best_mtime = ts;
+                            }
                         }
                     }
                 }
@@ -776,7 +822,7 @@ fn find_latest_camera_images(cfg: &AppConfig) -> Value {
                                 if let Ok(m) = std::fs::metadata(le).and_then(|m| m.modified()) {
                                     if let Ok(d) = m.duration_since(UNIX_EPOCH) {
                                         let mt = d.as_secs_f64();
-                                        if mt > best_mtime {
+                                        if mt > best_mtime + 2.0 {
                                             best_mtime = mt;
                                             best_ext = Some(le.clone());
                                             best_wrist = Some(lw.clone());
@@ -799,15 +845,133 @@ fn find_latest_camera_images(cfg: &AppConfig) -> Value {
         -1.0
     };
 
+    // If frame is stale (> 4 seconds old), current live capture_hz is effectively 0.0
+    let live_hz = if age_seconds >= 0.0 && age_seconds <= 4.0 {
+        capture_hz
+    } else {
+        0.0
+    };
+
     json!({
         "ready": best_ext.is_some() && best_wrist.is_some(),
         "age_seconds": age_seconds,
         "updated_at": best_mtime,
         "source": source,
         "message": message,
+        "capture_hz": live_hz,
+        "last_capture_hz": capture_hz,
+        "target_fps": target_fps,
+        "width": width,
+        "height": height,
+        "exterior_id": exterior_id,
+        "wrist_id": wrist_id,
+        "exterior_ms": exterior_ms,
+        "wrist_ms": wrist_ms,
+        "frame_seq": frame_seq,
+        "mode": mode,
+        "stream_running": stream_pid.is_some(),
+        "stream_pid": stream_pid,
         "exterior_path": best_ext.map(|p| p.to_string_lossy().to_string()),
         "wrist_path": best_wrist.map(|p| p.to_string_lossy().to_string()),
     })
+}
+
+async fn stop_camera_stream(state: &Arc<AppState>, reason: &str) -> bool {
+    let cfg = state.config.lock().await.clone();
+    let stop_file = cfg.preview_dir.join("camera_stream.stop");
+    let _ = std::fs::write(&stop_file, "stop");
+
+    let mut cam_proc = state.camera_stream_proc.lock().await;
+    if let Some(p) = cam_proc.take() {
+        if pid_alive(p.pid) {
+            kill_process_group_or_pid(p.pid);
+            drop(cam_proc);
+            state
+                .append_log(
+                    "CAMERA",
+                    format!("已释放后台实时相机流 (PID {})：{}", p.pid, reason),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            return true;
+        }
+    }
+    false
+}
+
+async fn start_camera_stream(state: &Arc<AppState>) -> std::result::Result<u32, String> {
+    {
+        let rec = state.record_proc.lock().await;
+        if let Some(ref p) = *rec {
+            if pid_alive(p.pid) {
+                return Err(format!("录制进程正在运行 (PID {})，由录制进程直接驱动实时相机流", p.pid));
+            }
+        }
+    }
+    {
+        let rol = state.rollout_proc.lock().await;
+        if let Some(ref p) = *rol {
+            if pid_alive(p.pid) {
+                return Err(format!("部署进程正在运行 (PID {})，由部署进程直接驱动实时相机流", p.pid));
+            }
+        }
+    }
+    {
+        let mut cam = state.camera_stream_proc.lock().await;
+        if let Some(ref p) = *cam {
+            if pid_alive(p.pid) {
+                return Ok(p.pid);
+            } else {
+                *cam = None;
+            }
+        }
+    }
+
+    let cfg = state.config.lock().await.clone();
+    let stop_file = cfg.preview_dir.join("camera_stream.stop");
+    let _ = std::fs::remove_file(&stop_file);
+
+    let py = python_bin_for_env(&cfg.conda_env);
+    let helper = cfg.project_root.join("scripts/franka_helper.py");
+    let log_file = cfg.logs_dir.join("camera_stream.log");
+
+    let mut cmd = Command::new(&py);
+    cmd.arg("-u")
+        .arg(&helper)
+        .arg("camera-stream")
+        .arg("--teleop-root")
+        .arg(&cfg.teleop_root)
+        .arg("--preview-dir")
+        .arg(&cfg.preview_dir)
+        .arg("--fps")
+        .arg("30")
+        .arg("--preview-fps")
+        .arg("8")
+        .arg("--stop-file")
+        .arg(&stop_file)
+        .current_dir(&cfg.teleop_root);
+
+    match spawn_logged_process(state.clone(), "CAMERA".to_string(), cmd, log_file.clone(), None).await {
+        Ok(pid) => {
+            let info = ManagedProcessInfo {
+                name: "camera-stream (Orbbec 30Hz)".to_string(),
+                pid,
+                cmd_summary: "Orbbec dual camera live stream (30Hz capture / 8Hz web)".to_string(),
+                started_at: now_sec(),
+                log_file: log_file.to_string_lossy().to_string(),
+                extra: json!({"fps": 30, "preview_fps": 8}),
+            };
+            *state.camera_stream_proc.lock().await = Some(info);
+            state
+                .append_log(
+                    "CAMERA",
+                    format!("已启动双 Orbbec 相机实时预览流 (PID {}，目标 30 Hz)", pid),
+                )
+                .await;
+            Ok(pid)
+        }
+        Err(e) => Err(format!("启动相机实时流失败: {}", e)),
+    }
 }
 
 async fn get_robot_state_cached(state: &Arc<AppState>, force_refresh: bool) -> Value {
@@ -911,7 +1075,7 @@ async fn api_state_handler(
     let force_robot = params.get("refresh_robot").map(|v| v == "1").unwrap_or(false);
     let cfg = state.config.lock().await.clone();
 
-    // Clean up exited record/rollout processes
+    // Clean up exited record/rollout/camera processes
     {
         let mut rec = state.record_proc.lock().await;
         if let Some(ref p) = *rec {
@@ -928,6 +1092,19 @@ async fn api_state_handler(
             }
         }
     }
+    let stream_pid = {
+        let mut cam = state.camera_stream_proc.lock().await;
+        if let Some(ref p) = *cam {
+            if pid_alive(p.pid) {
+                Some(p.pid)
+            } else {
+                *cam = None;
+                None
+            }
+        } else {
+            None
+        }
+    };
 
     let robot = get_robot_state_cached(&state, force_robot).await;
     let gpus = query_gpus().await;
@@ -936,7 +1113,7 @@ async fn api_state_handler(
     let rollout_active = state.rollout_proc.lock().await.clone();
     let preload_map = state.preload_procs.lock().await.clone();
     let deployments = scan_deployment_roots(&cfg, &preload_map).await;
-    let camera = find_latest_camera_images(&cfg);
+    let camera = find_latest_camera_images(&cfg, stream_pid);
     let conda_envs = discover_conda_envs(&cfg.teleop_root);
 
     // Read live rollout status file if active
@@ -1112,6 +1289,12 @@ async fn api_device_command_handler(
         }
     };
 
+    let resume_cam_after = if cmd_name == "preflight" || cmd_name == "camera_snapshot" {
+        stop_camera_stream(&state, "执行相机/五项预检前临时释放流").await
+    } else {
+        false
+    };
+
     state.append_log("DEVICE", format!("执行: {}", label)).await;
 
     let mut command = Command::new(&bin_or_py);
@@ -1133,6 +1316,9 @@ async fn api_device_command_handler(
         Err(e) => {
             let msg = format!("启动 `{}` 失败: {}", label, e);
             state.append_log("DEVICE", &msg).await;
+            if resume_cam_after {
+                let _ = start_camera_stream(&state).await;
+            }
             return Json(json!({"ok": false, "message": msg}));
         }
     };
@@ -1143,6 +1329,9 @@ async fn api_device_command_handler(
     }
 
     let wait_res = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output()).await;
+    if resume_cam_after {
+        let _ = start_camera_stream(&state).await;
+    }
     match wait_res {
         Ok(Ok(output)) => {
             let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1257,6 +1446,8 @@ async fn api_record_start_handler(
             }
         }
     }
+
+    let _ = stop_camera_stream(&state, "切换至遥操作录制进程独占双相机").await;
 
     let cfg = state.config.lock().await.clone();
     let base_cfg_path = cfg.teleop_root.join("scripts/config/record_config.yaml");
@@ -1689,6 +1880,8 @@ async fn api_deploy_start_handler(
         return Json(json!({"ok": false, "message": format!("部署目录不存在: {}", root.display())}));
     }
 
+    let _ = stop_camera_stream(&state, "切换至部署推理进程独占双相机").await;
+
     let (port, gpu) = known_task_port_gpu(&req.task_id);
     let launch_mode = req.launch_mode.unwrap_or_else(|| "hil_fast".to_string());
     let log_file = cfg.logs_dir.join("rollout.log");
@@ -1876,12 +2069,81 @@ async fn api_deploy_control_handler(
     Json(json!({"ok": true, "message": format!("已发送部署指令: {}", act)}))
 }
 
+async fn api_camera_meta_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let cfg = state.config.lock().await.clone();
+    let stream_pid = {
+        let mut cam = state.camera_stream_proc.lock().await;
+        if let Some(ref p) = *cam {
+            if pid_alive(p.pid) {
+                Some(p.pid)
+            } else {
+                *cam = None;
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let cam_info = find_latest_camera_images(&cfg, stream_pid);
+    Json(json!({
+        "ok": true,
+        "camera": cam_info,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CameraStreamReq {
+    action: String,
+}
+
+async fn api_camera_stream_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CameraStreamReq>,
+) -> Json<Value> {
+    let act = req.action.trim();
+    if act == "stop" {
+        let stopped = stop_camera_stream(&state, "用户在网页手动停止实时相机流").await;
+        return Json(json!({
+            "ok": true,
+            "stream_running": false,
+            "message": if stopped { "已停止后台实时相机流" } else { "后台实时相机流未在运行" },
+        }));
+    } else if act == "toggle" {
+        let is_running = {
+            let cam = state.camera_stream_proc.lock().await;
+            cam.as_ref().map(|p| pid_alive(p.pid)).unwrap_or(false)
+        };
+        if is_running {
+            let _ = stop_camera_stream(&state, "用户在网页切换关闭实时相机流").await;
+            return Json(json!({
+                "ok": true,
+                "stream_running": false,
+                "message": "已停止后台实时相机流",
+            }));
+        }
+    }
+
+    match start_camera_stream(&state).await {
+        Ok(pid) => Json(json!({
+            "ok": true,
+            "stream_running": true,
+            "pid": pid,
+            "message": format!("已开启双相机实时刷新流 (PID {}，目标 30 Hz)", pid),
+        })),
+        Err(e) => Json(json!({
+            "ok": false,
+            "stream_running": false,
+            "message": e,
+        })),
+    }
+}
+
 async fn api_camera_image_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(cam_name): AxumPath<String>,
 ) -> Response {
     let cfg = state.config.lock().await.clone();
-    let cam_info = find_latest_camera_images(&cfg);
+    let cam_info = find_latest_camera_images(&cfg, None);
     let key = if cam_name.starts_with("wrist") {
         "wrist_path"
     } else {
@@ -1911,7 +2173,7 @@ async fn api_camera_image_handler(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="424" height="240" viewBox="0 0 424 240">
         <rect width="100%" height="100%" fill="#0d1117"/>
         <text x="50%" y="46%" dominant-baseline="middle" text-anchor="middle" fill="#8b949e" font-family="system-ui,sans-serif" font-size="14">{}</text>
-        <text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" fill="#484f58" font-family="system-ui,sans-serif" font-size="12">等待实时观测或点击「抓取相机快照」</text>
+        <text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" fill="#484f58" font-family="system-ui,sans-serif" font-size="12">等待实时观测或点击「开启实时相机」</text>
         </svg>"##,
         label
     );
@@ -1943,6 +2205,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/deploy/unload", post(api_deploy_unload_handler))
         .route("/api/deploy/start", post(api_deploy_start_handler))
         .route("/api/deploy/control", post(api_deploy_control_handler))
+        .route("/api/camera/meta", get(api_camera_meta_handler))
+        .route("/api/camera/stream", post(api_camera_stream_handler))
         .route("/api/camera/{cam_name}", get(api_camera_image_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -2009,11 +2273,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server(cfg: AppConfig, host: &str, port: u16) -> Result<()> {
+    let has_teleop = cfg.teleop_root.exists();
     let state = Arc::new(AppState {
         config: Mutex::new(cfg),
         logs: Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)),
         record_proc: Mutex::new(None),
         rollout_proc: Mutex::new(None),
+        camera_stream_proc: Mutex::new(None),
         preload_procs: Mutex::new(HashMap::new()),
         cached_robot_state: Mutex::new((0.0, json!({}))),
     });
@@ -2024,6 +2290,14 @@ async fn run_server(cfg: AppConfig, host: &str, port: u16) -> Result<()> {
             format!("Franka Web 服务已启动，监听 http://{}:{}", host, port),
         )
         .await;
+
+    if has_teleop {
+        let state_cam = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let _ = start_camera_stream(&state_cam).await;
+        });
+    }
 
     let app = build_router(state);
     if port == 8016 {
