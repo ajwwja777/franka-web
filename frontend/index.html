@@ -463,10 +463,29 @@
                 </div>
               </div>
 
-              <div class="action-bar" style="margin-top:10px;">
-                <button class="btn btn-primary" id="btnPreloadGpu" onclick="preloadDeployToGpu()">⚡ 1. 预加载模型进 GPU</button>
-                <button class="btn btn-success btn-lg" id="btnStartDeploy" onclick="startDeployRollout()">▶ 2. 开始部署推理</button>
-                <button class="btn btn-danger" onclick="unloadDeployFromGpu()">卸载 GPU 模型</button>
+              <div class="action-bar" style="margin-top:10px; flex-wrap:wrap; gap:6px;">
+                <button class="btn btn-primary" id="btnPreloadAllGpu" onclick="preloadAllDeployToGpu()" title="同时将 absolute_joint_rtc_sft_20261025/step_5550 (GPU 0:8142) 与 absolute_eef_rtc_sft_20261025/step_5500 (GPU 1:8143) 预热进显存">⚡ 一键同时预热两个新模型 (Joint 5550 + EEF 5500)</button>
+                <button class="btn btn-primary" id="btnPreloadGpu" onclick="preloadDeployToGpu()">⚡ 预加载当前选中模型</button>
+                <button class="btn btn-success btn-lg" id="btnStartDeploy" onclick="startDeployRollout()">▶ 开始部署当前模型</button>
+                <button class="btn btn-danger btn-xs" onclick="unloadDeployFromGpu()">卸载当前模型</button>
+              </div>
+
+              <div class="sub-label" style="margin-top:12px;">已配置部署模型与 GPU 并行预热矩阵（可同时常驻显存、随时秒切部署）</div>
+              <div class="table-wrap" style="max-height:220px;">
+                <table class="compact-table">
+                  <thead>
+                    <tr>
+                      <th>模型 / Step</th>
+                      <th>动作空间</th>
+                      <th>GPU / 端口</th>
+                      <th>状态</th>
+                      <th>快捷操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="deployModelsMatrixBody">
+                    <tr><td colspan="5" class="muted">正在扫描部署 Checkpoint...</td></tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 

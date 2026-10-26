@@ -433,7 +433,9 @@ fn known_task_port_gpu(task_id: &str) -> (u16, String) {
         "green_pepper_plate_scene1" => (8129, "1".to_string()),
         "green_pepper_plate_scene2" => (8130, "2".to_string()),
         "green_block_insertion" => (8141, "3".to_string()),
-        _ => (8145, "3".to_string()),
+        "absolute_joint_rtc_sft_20261025" => (8142, "0".to_string()),
+        "absolute_eef_rtc_sft_20261025" => (8143, "1".to_string()),
+        _ => (8145, "2".to_string()),
     }
 }
 
@@ -592,6 +594,159 @@ pub async fn scan_deployment_roots(cfg: &AppConfig, preload_procs: &HashMap<Stri
                 }
             }
         }
+
+        // Also discover any additional checkpoint families under `<root>/checkpoints/<family_id>`
+        // such as `absolute_joint_rtc_sft_20261025/step_5550` and `absolute_eef_rtc_sft_20261025/step_5500`
+        let ckpts_root = root.join("checkpoints");
+        if let Ok(fam_entries) = std::fs::read_dir(&ckpts_root) {
+            for fe in fam_entries.flatten() {
+                let fp = fe.path();
+                if !fp.is_dir() {
+                    continue;
+                }
+                let fam_id = fe.file_name().to_string_lossy().to_string();
+                if fam_id.starts_with('.') {
+                    continue;
+                }
+                let already_present = tasks_out.iter().any(|t| t["task_id"].as_str() == Some(fam_id.as_str()));
+                if already_present {
+                    continue;
+                }
+
+                let mut steps: Vec<Value> = Vec::new();
+                let mut detected_config = String::new();
+                let mut detected_prompt = String::from(
+                    "Insert the green rectangular block from the table into the matching hole in the blue pegboard.",
+                );
+                let mut detected_action_type = String::from("delta_eef");
+                let mut detected_action_dim: i64 = 7;
+
+                if let Ok(step_entries) = std::fs::read_dir(&fp) {
+                    for se in step_entries.flatten() {
+                        let sp = se.path();
+                        if !sp.is_dir() {
+                            continue;
+                        }
+                        let step_name = se.file_name().to_string_lossy().to_string();
+                        if step_name.starts_with('.') {
+                            continue;
+                        }
+                        let has_safetensors = sp.join("model.safetensors").exists();
+                        let has_manifest = sp.join("manifest.json").exists();
+                        let has_orbax = sp.join("params").exists() || sp.join("_CHECKPOINT_METADATA").exists();
+
+                        if let Ok(m_txt) = std::fs::read_to_string(sp.join("manifest.json")) {
+                            if let Ok(mv) = serde_json::from_str::<Value>(&m_txt) {
+                                if let Some(cn) = mv["config_name"].as_str() {
+                                    detected_config = cn.to_string();
+                                }
+                                if let Some(pr) = mv["prompt"].as_str() {
+                                    detected_prompt = pr.to_string();
+                                }
+                                if let Some(at) = mv["action_type"].as_str() {
+                                    detected_action_type = at.to_string();
+                                }
+                                if let Some(ad) = mv["action_dim"].as_i64() {
+                                    detected_action_dim = ad;
+                                }
+                            }
+                        }
+                        if let Ok(c_txt) = std::fs::read_to_string(sp.join("ACTION_CONTRACT.json")) {
+                            if let Ok(cv) = serde_json::from_str::<Value>(&c_txt) {
+                                if let Some(at) = cv["action_type"].as_str() {
+                                    detected_action_type = at.to_string();
+                                }
+                                if let Some(ad) = cv["action_dim"].as_i64() {
+                                    detected_action_dim = ad;
+                                }
+                            }
+                        }
+
+                        steps.push(json!({
+                            "step": step_name,
+                            "path": sp.to_string_lossy(),
+                            "exists": true,
+                            "has_weights": has_safetensors || has_orbax || has_manifest,
+                            "action_type": detected_action_type,
+                            "action_dim": detected_action_dim,
+                        }));
+                    }
+                }
+
+                if steps.is_empty() {
+                    continue;
+                }
+                steps.sort_by(|a, b| b["step"].as_str().cmp(&a["step"].as_str()));
+                let default_step = steps[0]["step"].as_str().unwrap_or("step_5500").to_string();
+                let (port, gpu) = known_task_port_gpu(&fam_id);
+
+                let ready = http_healthz_ok(port).await;
+                let port_pid = find_pid_on_port(port);
+                let key = format!("{}:{}", root.display(), fam_id);
+                let loading_proc = preload_procs.get(&key).filter(|p| pid_alive(p.pid));
+
+                let server_status = if ready {
+                    "ready"
+                } else if loading_proc.is_some() {
+                    "loading"
+                } else {
+                    "stopped"
+                };
+
+                let label = match fam_id.as_str() {
+                    "absolute_joint_rtc_sft_20261025" => "absolute_joint_rtc_sft_20261025 (step_5550 · 8D 绝对关节角)",
+                    "absolute_eef_rtc_sft_20261025" => "absolute_eef_rtc_sft_20261025 (step_5500 · 7D 绝对末端位姿)",
+                    _ => fam_id.as_str(),
+                };
+
+                tasks_out.push(json!({
+                    "task_id": fam_id,
+                    "label": label,
+                    "config_name": detected_config,
+                    "action_type": detected_action_type,
+                    "action_dim": detected_action_dim,
+                    "prompt": detected_prompt,
+                    "default_step": default_step,
+                    "checkpoint_base_dir": fp.to_string_lossy(),
+                    "checkpoints": steps,
+                    "port": port,
+                    "gpu": gpu,
+                    "server_status": server_status,
+                    "server_pid": port_pid.or_else(|| loading_proc.map(|p| p.pid)),
+                    "cam_width": cam_width,
+                    "cam_height": cam_height,
+                    "cam_fps": cam_fps,
+                }));
+            }
+        }
+
+        // Enrich existing tasks with label/action_type and prioritize the two new 20261025 RTC-SFT checkpoints
+        for t in &mut tasks_out {
+            if t.get("action_type").is_none() {
+                t["action_type"] = json!("delta_eef");
+                t["action_dim"] = json!(7);
+            }
+            if t.get("label").is_none() {
+                let tid = t["task_id"].as_str().unwrap_or("task").to_string();
+                if tid == "green_block_insertion" {
+                    t["label"] = json!("green_block_insertion (4000/2000 · 7D 相对末端位姿)");
+                    // Default to 4000 if available
+                    if let Some(arr) = t["checkpoints"].as_array() {
+                        if arr.iter().any(|c| c["step"].as_str() == Some("4000")) {
+                            t["default_step"] = json!("4000");
+                        }
+                    }
+                } else {
+                    t["label"] = json!(tid);
+                }
+            }
+        }
+        tasks_out.sort_by_key(|t| match t["task_id"].as_str().unwrap_or("") {
+            "absolute_joint_rtc_sft_20261025" => 0,
+            "absolute_eef_rtc_sft_20261025" => 1,
+            "green_block_insertion" => 2,
+            _ => 3,
+        });
 
         let has_policy_server_sh = root.join("scripts/policy_server.sh").exists();
         let has_task_sh = root.join("scripts/task.sh").exists();
@@ -1698,38 +1853,116 @@ async fn api_dataset_replay_handler(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct PreloadDeployReq {
     deploy_root: String,
     task_id: String,
     checkpoint_step: Option<String>,
+    checkpoint_path: Option<String>,
 }
 
-async fn api_deploy_preload_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<PreloadDeployReq>,
-) -> Json<Value> {
+fn resolve_checkpoint_dir(root: &Path, task_id: &str, step_opt: Option<&str>, path_opt: Option<&str>) -> PathBuf {
+    if let Some(p) = path_opt {
+        let pb = PathBuf::from(p.trim());
+        if pb.is_dir() {
+            return pb;
+        }
+    }
+    let fam_dir = root.join("checkpoints").join(task_id);
+    if let Some(st) = step_opt {
+        let c1 = fam_dir.join(st);
+        if c1.is_dir() {
+            return c1;
+        }
+        let c2 = fam_dir.join(format!("step_{}", st));
+        if c2.is_dir() {
+            return c2;
+        }
+    }
+    match task_id {
+        "absolute_joint_rtc_sft_20261025" => fam_dir.join("step_5550"),
+        "absolute_eef_rtc_sft_20261025" => fam_dir.join("step_5500"),
+        "green_block_insertion" => {
+            if fam_dir.join("4000").is_dir() {
+                fam_dir.join("4000")
+            } else {
+                fam_dir.join("2000")
+            }
+        }
+        _ => {
+            if let Ok(entries) = std::fs::read_dir(&fam_dir) {
+                let mut dirs: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                dirs.sort();
+                if let Some(last) = dirs.pop() {
+                    return last;
+                }
+            }
+            fam_dir.join(step_opt.unwrap_or("2000"))
+        }
+    }
+}
+
+async fn preload_single_task(state: &Arc<AppState>, req: PreloadDeployReq) -> Value {
     let cfg = state.config.lock().await.clone();
     let root = PathBuf::from(req.deploy_root.trim());
     if !root.exists() {
-        return Json(json!({"ok": false, "message": format!("部署目录不存在: {}", root.display())}));
+        return json!({"ok": false, "task_id": req.task_id, "message": format!("部署目录不存在: {}", root.display())});
     }
 
     let (port, gpu) = known_task_port_gpu(&req.task_id);
     if http_healthz_ok(port).await {
-        return Json(json!({
+        return json!({
             "ok": true,
+            "task_id": req.task_id,
             "already_ready": true,
             "port": port,
             "gpu": gpu,
-            "message": format!("任务 {} 的 Policy Server 已在端口 {} (GPU {}) 就绪，可直接点击『开始部署』秒级启动！", req.task_id, port, gpu),
-        }));
+            "message": format!("任务 {} 已在端口 {} (GPU {}) 就绪！", req.task_id, port, gpu),
+        });
     }
 
-    let step = req.checkpoint_step.unwrap_or_else(|| "2000".to_string());
+    let ckpt_dir = resolve_checkpoint_dir(
+        &root,
+        &req.task_id,
+        req.checkpoint_step.as_deref(),
+        req.checkpoint_path.as_deref(),
+    );
+    let step = ckpt_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .or(req.checkpoint_step.clone())
+        .unwrap_or_else(|| "default".to_string());
     let log_file = cfg.logs_dir.join(format!("preload_{}.log", req.task_id));
 
-    let cmd = if root.join("scripts/task.sh").exists() {
+    let openpi_py = PathBuf::from("/data2/yjd/workspace/openpi-franka-pytorch-deploy/.venv/bin/python");
+    let helper = cfg.project_root.join("scripts/franka_helper.py");
+
+    let cmd = if ckpt_dir.join("manifest.json").is_file() && openpi_py.is_file() {
+        let mut c = Command::new(&openpi_py);
+        c.arg("-u")
+            .arg(&helper)
+            .arg("serve-checkpoint")
+            .arg("--checkpoint")
+            .arg(&ckpt_dir)
+            .arg("--deploy-root")
+            .arg(&root)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--gpu")
+            .arg(&gpu)
+            .arg("--delay")
+            .arg("5")
+            .env("CUDA_VISIBLE_DEVICES", &gpu)
+            .env("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+            .env("HF_HUB_OFFLINE", "1")
+            .env("WANDB_MODE", "disabled")
+            .current_dir(&root);
+        c
+    } else if root.join("scripts/task.sh").exists() {
         let mut c = Command::new("bash");
         c.arg(root.join("scripts/task.sh"))
             .arg("--checkpoint-step")
@@ -1745,18 +1978,22 @@ async fn api_deploy_preload_handler(
             .current_dir(&root);
         c
     } else {
-        return Json(json!({
+        return json!({
             "ok": false,
-            "message": format!("未在 {} 下找到 scripts/task.sh 或 scripts/policy_server.sh", root.display()),
-        }));
+            "task_id": req.task_id,
+            "message": format!("未找到可用的模型服务启动入口: {}", ckpt_dir.display()),
+        });
     };
 
     state
         .append_log(
             "PRELOAD",
             format!(
-                "正在预加载模型进 GPU: task={} step={} gpu={} port={} (首次加载约需 60-90 秒，加载完成后常驻显存)",
-                req.task_id, step, gpu, port
+                "正在预加载模型进 GPU: task={} ckpt={} gpu={} port={} (加载+XLA预热完成后常驻显存)",
+                req.task_id,
+                ckpt_dir.display(),
+                gpu,
+                port
             ),
         )
         .await;
@@ -1767,22 +2004,81 @@ async fn api_deploy_preload_handler(
             let info = ManagedProcessInfo {
                 name: format!("preload:{}:{}", req.task_id, step),
                 pid,
-                cmd_summary: format!("Policy Server {} (step {}, GPU {}, port {})", req.task_id, step, gpu, port),
+                cmd_summary: format!("Policy Server {} ({}, GPU {}, port {})", req.task_id, step, gpu, port),
                 started_at: now_sec(),
                 log_file: log_file.to_string_lossy().to_string(),
-                extra: json!({"task_id": req.task_id, "step": step, "port": port, "gpu": gpu}),
+                extra: json!({
+                    "task_id": req.task_id,
+                    "step": step,
+                    "checkpoint_path": ckpt_dir.to_string_lossy(),
+                    "port": port,
+                    "gpu": gpu,
+                }),
             };
             state.preload_procs.lock().await.insert(key, info);
-            Json(json!({
+            json!({
                 "ok": true,
+                "task_id": req.task_id,
                 "pid": pid,
                 "port": port,
                 "gpu": gpu,
-                "message": format!("已启动 GPU 预加载 (PID {})，请等待状态变为『GPU 已就绪』后点击开始部署。", pid),
-            }))
+                "checkpoint_path": ckpt_dir.to_string_lossy(),
+                "message": format!("已启动 {} ({}) GPU 预加载 (PID {}, GPU {}, :{})", req.task_id, step, pid, gpu, port),
+            })
         }
-        Err(e) => Json(json!({"ok": false, "message": format!("启动 GPU 预加载失败: {}", e)})),
+        Err(e) => json!({
+            "ok": false,
+            "task_id": req.task_id,
+            "message": format!("启动 {} GPU 预加载失败: {}", req.task_id, e),
+        }),
     }
+}
+
+async fn api_deploy_preload_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PreloadDeployReq>,
+) -> Json<Value> {
+    Json(preload_single_task(&state, req).await)
+}
+
+#[derive(Deserialize)]
+struct PreloadAllDeployReq {
+    deploy_root: String,
+    items: Option<Vec<PreloadDeployReq>>,
+}
+
+async fn api_deploy_preload_all_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PreloadAllDeployReq>,
+) -> Json<Value> {
+    let root_str = req.deploy_root.trim().to_string();
+    let items = req.items.unwrap_or_else(|| {
+        vec![
+            PreloadDeployReq {
+                deploy_root: root_str.clone(),
+                task_id: "absolute_joint_rtc_sft_20261025".to_string(),
+                checkpoint_step: Some("step_5550".to_string()),
+                checkpoint_path: None,
+            },
+            PreloadDeployReq {
+                deploy_root: root_str.clone(),
+                task_id: "absolute_eef_rtc_sft_20261025".to_string(),
+                checkpoint_step: Some("step_5500".to_string()),
+                checkpoint_path: None,
+            },
+        ]
+    });
+
+    let mut results = Vec::new();
+    for item in items {
+        results.push(preload_single_task(&state, item).await);
+    }
+    let ok_count = results.iter().filter(|r| r["ok"].as_bool() == Some(true)).count();
+    Json(json!({
+        "ok": ok_count > 0,
+        "results": results,
+        "message": format!("已触发 {} 个模型的并行 GPU 预加载（Joint step_5550 @ GPU0:8142 + EEF step_5500 @ GPU1:8143），全部就绪后可直接切换秒开部署！", ok_count),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2059,7 +2355,12 @@ async fn api_deploy_control_handler(
             state
                 .append_log("DEPLOY", format!("已停止部署推理进程 (PID {})，GPU 模型保持常驻", p.pid))
                 .await;
-            return Json(json!({"ok": true, "message": "已停止部署推理（GPU 模型仍保持预热状态，可随时再次开始）"}));
+            let state_cam = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let _ = start_camera_stream(&state_cam).await;
+            });
+            return Json(json!({"ok": true, "message": "已停止部署推理（GPU 模型仍保持预热状态，实时相机流已自动恢复）"}));
         }
     }
 
@@ -2202,6 +2503,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/datasets/preview", post(api_dataset_preview_handler))
         .route("/api/datasets/replay", post(api_dataset_replay_handler))
         .route("/api/deploy/preload", post(api_deploy_preload_handler))
+        .route("/api/deploy/preload_all", post(api_deploy_preload_all_handler))
         .route("/api/deploy/unload", post(api_deploy_unload_handler))
         .route("/api/deploy/start", post(api_deploy_start_handler))
         .route("/api/deploy/control", post(api_deploy_control_handler))
@@ -2325,6 +2627,8 @@ mod tests {
     #[test]
     fn test_known_task_port_gpu() {
         assert_eq!(known_task_port_gpu("green_block_insertion"), (8141, "3".to_string()));
+        assert_eq!(known_task_port_gpu("absolute_joint_rtc_sft_20261025"), (8142, "0".to_string()));
+        assert_eq!(known_task_port_gpu("absolute_eef_rtc_sft_20261025"), (8143, "1".to_string()));
         assert_eq!(known_task_port_gpu("in_the_pot"), (8128, "3".to_string()));
         assert_eq!(known_task_port_gpu("book_shelf"), (8127, "2".to_string()));
     }

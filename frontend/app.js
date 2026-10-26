@@ -832,18 +832,34 @@ function getSelectedTaskObj() {
   return (depObj.tasks || []).find((t) => t.task_id === taskVal) || (depObj.tasks || [])[0] || null;
 }
 
+function formatActionTypeLabel(actionType, actionDim) {
+  if (actionType === "absolute_joint_position_gripper_command" || actionDim === 8) {
+    return "8D 绝对关节角 + 夹爪";
+  }
+  if (actionType === "absolute_eef_rotvec_gripper_command") {
+    return "7D 绝对末端位姿 + 夹爪";
+  }
+  return "7D 相对末端位姿 + 夹爪";
+}
+
 function onDeployRootChange(preferredTask, preferredStep) {
   const depObj = getSelectedDeployObj();
   const taskSel = document.getElementById("deployTaskSelect");
   if (!depObj || !taskSel) return;
   const tasks = depObj.tasks || [];
   taskSel.innerHTML = tasks
-    .map((t) => `<option value="${t.task_id}">${t.task_id} [${t.server_status === "ready" ? "★ GPU已预热" : t.server_status}]</option>`)
+    .map(
+      (t) =>
+        `<option value="${t.task_id}">${t.label || t.task_id} [${
+          t.server_status === "ready" ? "★ GPU已就绪" : t.server_status === "loading" ? "⏳ 预热中" : "未加载"
+        }]</option>`
+    )
     .join("");
   if (preferredTask && tasks.some((t) => t.task_id === preferredTask)) {
     taskSel.value = preferredTask;
   }
   onDeployTaskChange(preferredStep);
+  renderDeployModelsMatrix(depObj);
 }
 
 function onDeployTaskChange(preferredStep) {
@@ -885,16 +901,120 @@ function updateSelectedTaskMeta() {
   const isReady = taskObj.server_status === "ready";
   const isLoading = taskObj.server_status === "loading";
 
+  const actLabel = formatActionTypeLabel(ckptObj?.action_type || taskObj.action_type, ckptObj?.action_dim || taskObj.action_dim);
   if (metaEl) {
-    metaEl.textContent = `端口: ${taskObj.port} | GPU: ${taskObj.gpu} | 状态: ${
+    metaEl.textContent = `动作契约: ${actLabel} | 端口: ${taskObj.port} | GPU: ${taskObj.gpu} | 状态: ${
       isReady ? "GPU 常驻就绪 (秒级启动)" : isLoading ? "正在加载进 GPU..." : "未加载"
     } | 权重: ${ckptObj?.has_weights ? "已验证存在" : "未找到"}`;
   }
   if (gpuBadge) {
-    gpuBadge.textContent = isReady ? `● GPU ${taskObj.gpu} 已就绪 (:${taskObj.port})` : isLoading ? "⏳ GPU 预热中..." : "未预热";
+    const depObj = getSelectedDeployObj();
+    const readyCount = (depObj?.tasks || []).filter((t) => t.server_status === "ready").length;
+    const totalCount = (depObj?.tasks || []).length;
+    gpuBadge.textContent = isReady
+      ? `● 当前模型已就绪 (GPU ${taskObj.gpu}:${taskObj.port} · 共 ${readyCount}/${totalCount} 就绪)`
+      : isLoading
+      ? `⏳ GPU ${taskObj.gpu} 预热中... (${readyCount}/${totalCount} 就绪)`
+      : `未预热 (共 ${readyCount}/${totalCount} 就绪)`;
     gpuBadge.className = "mini-pill " + (isReady ? "ok" : isLoading ? "warn" : "");
   }
   setDot("subDotGpu", isReady ? "ok" : isLoading ? "warn" : "");
+  const depObj = getSelectedDeployObj();
+  if (depObj) {
+    renderDeployModelsMatrix(depObj);
+  }
+}
+
+function renderDeployModelsMatrix(depObj) {
+  const tbody = document.getElementById("deployModelsMatrixBody");
+  if (!tbody || !depObj) return;
+  const tasks = depObj.tasks || [];
+  const currentTaskId = document.getElementById("deployTaskSelect")?.value;
+  if (tasks.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="muted">未找到 Checkpoint</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = tasks
+    .map((t) => {
+      const ckpt = (t.checkpoints || [])[0] || {};
+      const stepStr = ckpt.step || t.default_step || "";
+      const pathStr = ckpt.path || t.checkpoint_base_dir || "";
+      const isSelected = t.task_id === currentTaskId;
+      const isReady = t.server_status === "ready";
+      const isLoading = t.server_status === "loading";
+      const statusBadge = isReady
+        ? `<span class="mini-pill ok">● GPU已就绪</span>`
+        : isLoading
+        ? `<span class="mini-pill warn">⏳ 预加载中</span>`
+        : `<span class="mini-pill">○ 未加载</span>`;
+      const actShort = formatActionTypeLabel(ckpt.action_type || t.action_type, ckpt.action_dim || t.action_dim);
+      return `<tr style="${isSelected ? "background:rgba(37,99,235,0.06);" : ""}">
+        <td>
+          <div style="font-weight:700;">${isSelected ? "▸ " : ""}${t.task_id} <span class="mono muted">(${stepStr})</span></div>
+          <div class="mono muted" style="font-size:11px;word-break:break-all;">${pathStr}</div>
+        </td>
+        <td><span class="mono" style="font-size:11px;">${actShort}</span></td>
+        <td class="mono">GPU ${t.gpu} :${t.port}</td>
+        <td>${statusBadge}</td>
+        <td>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;">
+            <button class="btn btn-xs" onclick="selectTaskInMatrix('${t.task_id}','${stepStr}')">选中</button>
+            <button class="btn btn-xs btn-primary" onclick="preloadSpecificTask('${depObj.deploy_root}','${t.task_id}','${stepStr}','${pathStr}')">${
+        isReady ? "已就绪" : "预热"
+      }</button>
+            <button class="btn btn-xs btn-success" onclick="quickStartTask('${t.task_id}','${stepStr}')">▶ 部署</button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function selectTaskInMatrix(taskId, stepStr) {
+  const taskSel = document.getElementById("deployTaskSelect");
+  if (taskSel) {
+    taskSel.value = taskId;
+    onDeployTaskChange(stepStr);
+  }
+}
+
+async function preloadSpecificTask(deployRoot, taskId, stepStr, ckptPath) {
+  selectTaskInMatrix(taskId, stepStr);
+  setLastOp("PRELOAD", `正在预加载 ${taskId} (${stepStr}) 进 GPU...`);
+  const res = await fetch("/api/deploy/preload", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      deploy_root: deployRoot,
+      task_id: taskId,
+      checkpoint_step: stepStr,
+      checkpoint_path: ckptPath,
+    }),
+  });
+  const data = await res.json();
+  setLastOp(data.ok ? "PRELOAD" : "WARN", data.message || "预加载请求已发送");
+  refreshState(true);
+}
+
+async function preloadAllDeployToGpu() {
+  const depObj = getSelectedDeployObj();
+  if (!depObj) return;
+  setLastOp("PRELOAD", "正在同时预加载 Joint step_5550 与 EEF step_5500 进不同 GPU...");
+  const res = await fetch("/api/deploy/preload_all", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      deploy_root: depObj.deploy_root,
+    }),
+  });
+  const data = await res.json();
+  setLastOp(data.ok ? "PRELOAD" : "WARN", data.message || "已触发批量 GPU 预加载");
+  refreshState(true);
+}
+
+async function quickStartTask(taskId, stepStr) {
+  selectTaskInMatrix(taskId, stepStr);
+  await startDeployRollout();
 }
 
 async function addCustomDeployRoot() {
@@ -912,9 +1032,10 @@ async function addCustomDeployRoot() {
 async function preloadDeployToGpu() {
   const depObj = getSelectedDeployObj();
   const taskObj = getSelectedTaskObj();
-  const step = document.getElementById("deployStepSelect")?.value || "2000";
+  const step = document.getElementById("deployStepSelect")?.value || taskObj?.default_step || "2000";
+  const ckptPath = document.getElementById("deployCkptPathDisplay")?.textContent || "";
   if (!depObj || !taskObj) return;
-  setLastOp("PRELOAD", `预加载 ${taskObj.task_id} (step ${step}) 进 GPU...`);
+  setLastOp("PRELOAD", `预加载 ${taskObj.task_id} (${step}) 进 GPU ${taskObj.gpu}...`);
   const res = await fetch("/api/deploy/preload", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -922,11 +1043,12 @@ async function preloadDeployToGpu() {
       deploy_root: depObj.deploy_root,
       task_id: taskObj.task_id,
       checkpoint_step: step,
+      checkpoint_path: ckptPath,
     }),
   });
   const data = await res.json();
   setLastOp(data.ok ? "PRELOAD" : "WARN", data.message || "预加载请求已发送");
-  refreshState();
+  refreshState(true);
 }
 
 async function unloadDeployFromGpu() {

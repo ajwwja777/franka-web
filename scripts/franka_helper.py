@@ -717,10 +717,326 @@ def cmd_record_wrapper(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_checkpoint(args: argparse.Namespace) -> int:
+    """
+    Universal Policy Server for Franka checkpoints:
+    Supports:
+    - absolute_joint_rtc_sft_20261025/step_5550 (8D: 7 absolute joint rad + 1 gripper)
+    - absolute_eef_rtc_sft_20261025/step_5500 (7D: 6 absolute EEF pos+rotvec + 1 gripper)
+    - green_block_insertion/2000 & 4000 (7D: 6 delta EEF + 1 gripper)
+    Preloads weights onto GPU and runs XLA warmup before opening /healthz on 127.0.0.1:<port>.
+    """
+    import dataclasses
+    import hashlib
+    import logging
+
+    ckpt_path = pathlib.Path(args.checkpoint).resolve()
+    deploy_root = pathlib.Path(args.deploy_root).resolve()
+    if not ckpt_path.is_dir():
+        print(f"[SERVE-ERR] Checkpoint 目录不存在: {ckpt_path}", file=sys.stderr, flush=True)
+        return 1
+
+    if args.gpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("WANDB_MODE", "disabled")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+    for d in ("cache/openpi", "cache/huggingface", "cache/jax", "cache/pycache", "tmp", "runtime"):
+        try:
+            (deploy_root / d).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    os.environ.setdefault("OPENPI_DATA_HOME", str(deploy_root / "cache/openpi"))
+    os.environ.setdefault("HF_HOME", str(deploy_root / "cache/huggingface"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(deploy_root / "cache"))
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(deploy_root / "cache/jax"))
+    os.environ.setdefault("TMPDIR", str(deploy_root / "tmp"))
+    os.environ.setdefault("PYTHONPYCACHEPREFIX", str(deploy_root / "cache/pycache"))
+
+    # Prepend third_party and checkpoint-embedded source tree
+    extra_paths = [
+        deploy_root / "third_party/expo-openpi/packages/openpi-client/src",
+        deploy_root / "third_party/expo-openpi/src",
+        deploy_root / "third_party/expo-ft",
+        deploy_root,
+    ]
+    if (ckpt_path / "source").is_dir():
+        extra_paths.append(ckpt_path / "source")
+    for p in extra_paths:
+        if p.exists():
+            sys.path.insert(0, str(p))
+
+    logging.basicConfig(level=logging.INFO, force=True)
+
+    manifest_path = ckpt_path / "manifest.json"
+    if not manifest_path.is_file():
+        print(f"[SERVE-ERR] 缺少 manifest.json: {manifest_path}", file=sys.stderr, flush=True)
+        return 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    contract_path = ckpt_path / "ACTION_CONTRACT.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.is_file() else {}
+
+    config_name = manifest.get("config_name", "expo_pi05_franka_green_block_rtc")
+    asset_id = manifest.get("asset_id", "franka_green_block_insertion_20261023")
+    action_dim = int(manifest.get("action_dim") or contract.get("action_dim") or 7)
+    state_dim = int(manifest.get("state_dim") or contract.get("state_dim") or 15)
+    action_horizon = int(manifest.get("action_horizon") or contract.get("action_horizon") or 16)
+    replan_steps = int(manifest.get("replan_steps") or contract.get("replan_steps") or 8)
+    action_type = (
+        manifest.get("action_type")
+        or contract.get("action_type")
+        or ("delta_eef" if action_dim == 7 else "absolute_joint_position_gripper_command")
+    )
+    prompt = manifest.get(
+        "prompt",
+        "Insert the green rectangular block from the table into the matching hole in the blue pegboard.",
+    )
+    optimizer_step = manifest.get("optimizer_step", ckpt_path.name)
+
+    print(
+        f"[SERVE] 正在加载模型: ckpt={ckpt_path} config={config_name} asset={asset_id} "
+        f"action_type={action_type} action_dim={action_dim} port={args.port} gpu={os.environ.get('CUDA_VISIBLE_DEVICES')}",
+        flush=True,
+    )
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from openpi import transforms
+    from openpi.models import model as model_lib
+    from openpi.shared import nnx_utils
+    from openpi.serving.websocket_policy_server import WebsocketPolicyServer
+    from openpi.training.config import AssetsConfig
+    from expo_ft.utils.train_utils import _restore_pi05_params
+
+    select_rotvec_branch = None
+    if config_name == "expo_pi05_franka_absolute_joint_v1_full" or action_type == "absolute_joint_position_gripper_command":
+        from integrations.franka.realtime_expo.absolute_joint_v1.adapter import register_config
+        from integrations.franka.realtime_expo.absolute_joint_v1.representation import select_rotvec_branch as _srb
+        select_rotvec_branch = _srb
+    elif config_name == "expo_pi05_franka_absolute_eef_v1_full" or action_type == "absolute_eef_rotvec_gripper_command":
+        from integrations.franka.realtime_expo.absolute_eef_v1.adapter import register_config
+        from integrations.franka.realtime_expo.absolute_eef_v1.representation import select_rotvec_branch as _srb
+        select_rotvec_branch = _srb
+    else:
+        from integrations.franka.realtime_expo.official_franka import register_config
+
+    rep_file = ckpt_path / "assets" / asset_id / "REPRESENTATION.json"
+    rep_data = json.loads(rep_file.read_text(encoding="utf-8")) if rep_file.is_file() else {}
+    reference_rotvec = tuple(rep_data["reference_rotvec"]) if "reference_rotvec" in rep_data else None
+    branch_action_indices = rep_data.get("apply_to_action_indices", [])
+
+    config = register_config()
+    config = dataclasses.replace(
+        config,
+        data=dataclasses.replace(
+            config.data,
+            assets=AssetsConfig(assets_dir=str(ckpt_path / "assets"), asset_id=asset_id),
+        ),
+    )
+    data_cfg = config.data.create(config.assets_dirs, config.model)
+    params = _restore_pi05_params(str(ckpt_path / "params"))
+    params = jax.device_put(params)
+    model = config.model.load(params, remove_extra_params=False)
+    model.eval()
+
+    class UniversalFrankaPolicy:
+        def __init__(self) -> None:
+            self.path = ckpt_path
+            self.model = model
+            self.sample = nnx_utils.module_jit(
+                model.sample_actions, static_argnames=("num_steps", "num_samples", "train")
+            )
+            self.sample_prefix = nnx_utils.module_jit(
+                model.sample_actions_with_prefix, static_argnames=("num_steps", "num_samples")
+            )
+            self.inputs = transforms.compose(
+                [
+                    *data_cfg.repack_transforms.inputs,
+                    *data_cfg.data_transforms.inputs,
+                    transforms.Normalize(data_cfg.norm_stats, use_quantiles=data_cfg.use_quantile_norm),
+                    *data_cfg.model_transforms.inputs,
+                ]
+            )
+            self.outputs = transforms.compose(
+                [
+                    *data_cfg.model_transforms.outputs,
+                    transforms.Unnormalize(data_cfg.norm_stats, use_quantiles=data_cfg.use_quantile_norm),
+                    *data_cfg.data_transforms.outputs,
+                ]
+            )
+            self.normalize_prefix = transforms.Normalize(
+                {"actions": data_cfg.norm_stats["actions"]}, use_quantiles=data_cfg.use_quantile_norm
+            )
+            self.rng = jax.random.key(42)
+            self.metadata = {
+                "prompt": prompt,
+                "asset_id": asset_id,
+                "action_horizon": action_horizon,
+                "state_dim": state_dim,
+                "action_dim": action_dim,
+                "action_type": action_type,
+                "task_id": ckpt_path.parent.name,
+                "config_name": config.name,
+                "checkpoint_id": f"xiqing/{ckpt_path.parent.name}/{optimizer_step}",
+                "checkpoint_path": str(ckpt_path),
+                "serving_framework": "jax-expo",
+                "control_hz": 30,
+                "replan_steps": replan_steps,
+                "prefix_protocol": "clean-command-prefix-v1",
+                "num_denoising_steps": 10,
+                "rtc_delay": int(args.delay),
+            }
+
+        def infer(self, request: dict[str, Any], *, key: Any = None) -> dict[str, Any]:
+            t_start = time.perf_counter()
+            req_prompt = request.get("prompt", prompt)
+            if "images" in request and isinstance(request["images"], dict):
+                ext_img = np.asarray(request["images"]["exterior_image"], dtype=np.uint8)
+                wrist_img = np.asarray(request["images"]["wrist_image"], dtype=np.uint8)
+            else:
+                ext_img = np.asarray(
+                    request.get("observation/exterior_image_1_left", request.get("exterior_image")),
+                    dtype=np.uint8,
+                )
+                wrist_img = np.asarray(
+                    request.get("observation/wrist_image_left", request.get("wrist_image")),
+                    dtype=np.uint8,
+                )
+            state_arr = np.asarray(
+                request.get("state", request.get("observation/state")), dtype=np.float32
+            )
+            raw = {
+                "state": state_arr,
+                "prompt": req_prompt,
+                "exterior_image": ext_img,
+                "wrist_image": wrist_img,
+            }
+            inputs = self.inputs(raw)
+            obs = model_lib.Observation.from_dict(jax.tree.map(lambda x: jnp.asarray(x)[None], inputs))
+
+            prefix = np.asarray(request.get("prefix_actions", np.zeros((0, action_dim))), dtype=np.float32)
+            if prefix.ndim != 2 or prefix.shape[1] != action_dim or not np.isfinite(prefix).all():
+                raise ValueError(f"prefix_actions must be finite [delay, {action_dim}]")
+            delay = len(prefix)
+            if not 0 <= delay <= 8:
+                raise ValueError("RTC delay must be in [0, 8]")
+            if key is None:
+                self.rng, key = jax.random.split(self.rng)
+
+            model_start = time.perf_counter()
+            if delay > 0:
+                prefix_for_norm = np.array(prefix, dtype=np.float32, copy=True)
+                if (
+                    select_rotvec_branch is not None
+                    and reference_rotvec is not None
+                    and branch_action_indices == [3, 4, 5]
+                ):
+                    prefix_for_norm[..., 3:6] = select_rotvec_branch(prefix_for_norm[..., 3:6], reference_rotvec)
+                normalized = self.normalize_prefix({"actions": prefix_for_norm})["actions"]
+                pad_width = 32 - action_dim
+                padded = np.pad(normalized, ((0, 0), (0, pad_width))).astype(np.float32)
+                action = self.sample_prefix(key, obs, prefix=jnp.asarray(padded)[None], num_steps=10, num_samples=1)
+            else:
+                action = self.sample(key, obs, num_steps=10, num_samples=1, train=False)
+
+            normalized_action = np.asarray(action[0])
+            model_seconds = time.perf_counter() - model_start
+            result = self.outputs({"state": np.asarray(inputs["state"]), "actions": normalized_action})["actions"]
+            if result.shape != (action_horizon, action_dim) or not np.isfinite(result).all():
+                raise RuntimeError(
+                    f"Invalid sampler output shape {result.shape}, expected ({action_horizon}, {action_dim})"
+                )
+            return {
+                "actions": result.astype(np.float32),
+                "delay": delay,
+                "action_type": action_type,
+                "action_dim": action_dim,
+                "policy_timing": {
+                    "model_ms": model_seconds * 1000.0,
+                    "total_ms": (time.perf_counter() - t_start) * 1000.0,
+                },
+            }
+
+        def reset(self) -> None:
+            pass
+
+    policy_srv = UniversalFrankaPolicy()
+
+    # Construct warmup observation
+    example_npz = ckpt_path / "example_observation.npz"
+    if not example_npz.is_file():
+        alt_npz = deploy_root / "checkpoints/green_block_insertion/4000/example_observation.npz"
+        if alt_npz.is_file():
+            example_npz = alt_npz
+
+    if example_npz.is_file():
+        with np.load(example_npz, allow_pickle=False) as z:
+            warmup_req = {
+                "state": z["state"].astype(np.float32),
+                "images": {
+                    "exterior_image": z["exterior_image"].astype(np.uint8),
+                    "wrist_image": z["wrist_image"].astype(np.uint8),
+                },
+                "prompt": prompt,
+            }
+    else:
+        dummy_state = np.array(
+            [
+                -0.03213387,
+                0.23953748,
+                -0.1074977,
+                -2.28319335,
+                0.05735594,
+                2.56669164,
+                0.6653772,
+                0.94,
+                1.0,
+                0.50,
+                0.0,
+                0.30,
+                2.8531,
+                -1.3145,
+                0.0356,
+            ],
+            dtype=np.float32,
+        )
+        dummy_img = np.zeros((240, 424, 3), dtype=np.uint8)
+        warmup_req = {
+            "state": dummy_state,
+            "images": {"exterior_image": dummy_img, "wrist_image": dummy_img},
+            "prompt": prompt,
+        }
+
+    print("[SERVE] 正在执行 XLA/JAX JIT 预热编译 (boot + prefix)...", flush=True)
+    base_actions = policy_srv.infer(warmup_req)["actions"]
+    delay_val = int(args.delay)
+    if 1 <= delay_val <= 8:
+        for _ in range(2):
+            policy_srv.infer({**warmup_req, "prefix_actions": base_actions[:delay_val]})
+    print(
+        f"[SERVE] ✅ 模型预热完成！正在监听 ws://127.0.0.1:{args.port} (action_type={action_type}, dim={action_dim})",
+        flush=True,
+    )
+    WebsocketPolicyServer(
+        policy_srv, host="127.0.0.1", port=int(args.port), metadata=policy_srv.metadata
+    ).serve_forever()
+    return 0
+
+
 def cmd_hil_rollout(args: argparse.Namespace) -> int:
     """
     Enhanced Policy Deployment Rollout Runner:
     - Connects to an already-warm Policy Server on 127.0.0.1:<port> (instant startup!)
+    - Supports all 3 action contracts:
+      1) absolute_joint_position_gripper_command (8D: 7 joint rad + 1 gripper)
+      2) absolute_eef_rotvec_gripper_command (7D: 6 absolute EEF xyz+rotvec + 1 gripper)
+      3) delta_eef (7D: 6 delta EEF + 1 gripper)
     - Real-time camera preview + live capture/control Hz display
     - Live Pause / Resume via web button or hotkey (`runtime/deploy_control.json`)
     - SpaceMouse HIL auto-interruption & optional auto-resume
@@ -728,6 +1044,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
     """
     deploy_root = pathlib.Path(args.deploy_root).resolve()
     teleop_root = pathlib.Path(args.teleop_root).resolve()
+    ckpt_path = pathlib.Path(args.checkpoint).resolve()
     preview_dir = pathlib.Path(args.preview_dir).resolve()
     control_file = pathlib.Path(args.control_file).resolve()
     status_file = pathlib.Path(args.status_file).resolve()
@@ -741,13 +1058,31 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
         sys.path.insert(0, str(deploy_root / "integrations" / "franka" / "runtime"))
     sys.path.insert(0, str(deploy_root))
 
+    # Inspect checkpoint contract on disk
+    disk_contract: dict[str, Any] = {}
+    if (ckpt_path / "ACTION_CONTRACT.json").is_file():
+        try:
+            disk_contract = json.loads((ckpt_path / "ACTION_CONTRACT.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    elif (ckpt_path / "manifest.json").is_file():
+        try:
+            disk_contract = json.loads((ckpt_path / "manifest.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
     state_doc: dict[str, Any] = {
         "phase": "initializing",
         "mode": "policy",  # "policy" | "paused" | "hil"
         "step": 0,
         "hil_steps": 0,
         "policy_steps": 0,
+        "recorded_frames": 0,
+        "hil_frames": 0,
         "capture_hz": 0.0,
+        "action_type": disk_contract.get("action_type", "delta_eef"),
+        "action_dim": int(disk_contract.get("action_dim", 7)),
+        "checkpoint": str(ckpt_path),
         "hil_enabled": bool(args.enable_hil),
         "auto_resume": bool(args.auto_resume),
         "idle_resume_sec": float(args.idle_resume_sec),
@@ -770,6 +1105,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
     publish_state()
 
     import numpy as np
+    import scipy.spatial.transform as st
     from interface import FrankaConfig, Franka
     from openpi_client import websocket_client_policy
     from lerobot.cameras.configs import ColorMode, Cv2Rotation
@@ -777,8 +1113,19 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
 
     print(f"[DEPLOY] 连接本地 GPU Policy Server: 127.0.0.1:{args.port} ...", flush=True)
     policy = websocket_client_policy.WebsocketClientPolicy("127.0.0.1", int(args.port))
-    server_meta = policy.get_server_metadata()
-    print(f"[DEPLOY] Policy Server 就绪: {json.dumps(str(server_meta))[:200]}", flush=True)
+    server_meta = policy.get_server_metadata() or {}
+    action_type = (
+        server_meta.get("action_type")
+        or disk_contract.get("action_type")
+        or ("absolute_joint_position_gripper_command" if server_meta.get("action_dim") == 8 else "delta_eef")
+    )
+    action_dim = int(server_meta.get("action_dim") or disk_contract.get("action_dim") or 7)
+    publish_state(action_type=action_type, action_dim=action_dim)
+    print(
+        f"[DEPLOY] Policy Server 就绪: action_type={action_type} action_dim={action_dim} "
+        f"meta={json.dumps(str(server_meta))[:220]}",
+        flush=True,
+    )
 
     spacemouse = None
     if args.enable_hil:
@@ -847,7 +1194,9 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                 {
                     "task": args.task,
                     "prompt": args.prompt,
-                    "checkpoint": args.checkpoint,
+                    "checkpoint": str(ckpt_path),
+                    "action_type": action_type,
+                    "action_dim": action_dim,
                     "record_mode": args.record_mode,
                     "fps": fps,
                     "created_at": stamp,
@@ -869,6 +1218,9 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _sig_handler)
     signal.signal(signal.SIGINT, _sig_handler)
 
+    joint_lower = np.array([-2.85, -1.72, -2.85, -3.03, -2.85, 0.02, -2.85], dtype=np.float64)
+    joint_upper = np.array([2.85, 1.72, 2.85, -0.10, 2.85, 3.70, 2.85], dtype=np.float64)
+
     try:
         publish_state(phase="connecting_robot", message="正在连接机械臂与双相机并回 Home 位...")
         robot.connect()
@@ -876,7 +1228,11 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
             print("[DEPLOY] 机械臂正在复位到 Home 位...", flush=True)
             robot.reset()
 
-        publish_state(phase="running", mode="policy", message="模型正在实时推理控制中")
+        publish_state(
+            phase="running",
+            mode="policy",
+            message=f"模型正在实时推理控制中 ({action_type}, {action_dim}D)",
+        )
         chunk: np.ndarray | None = None
         chunk_idx = 0
         open_loop_horizon = int(args.open_loop_horizon)
@@ -897,10 +1253,10 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                     if act == "stop":
                         print("[DEPLOY] 收到网页停止指令，正在安全退出...", flush=True)
                         break
-                    elif act == "pause":
+                    elif act in ("pause", "enter_hil"):
                         manual_paused = True
                         chunk = None
-                        print("[DEPLOY] ⏸ 已暂停模型推理（可随时恢复或用 SpaceMouse 接管）", flush=True)
+                        print("[DEPLOY] ⏸ 已暂停模型推理（可随时移动 SpaceMouse 微调或点击恢复）", flush=True)
                     elif act == "resume":
                         manual_paused = False
                         chunk = None
@@ -952,7 +1308,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                         "height": cam_height,
                         "exterior_ms": obs_ms,
                         "wrist_ms": obs_ms,
-                        "message": f"部署运行中 ({state_doc['mode'].upper()}) · 频率 {actual_hz:.1f} Hz · 步数 {state_doc['step']}",
+                        "message": f"部署运行中 ({state_doc['mode'].upper()} · {action_type}) · 频率 {actual_hz:.1f} Hz · 步数 {state_doc['step']}",
                     },
                 )
 
@@ -988,7 +1344,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                 else:
                     active_mode = "paused"
                     if prev_mode != "paused":
-                        print("[DEPLOY] ⏸ SpaceMouse 已停止，当前处于等待手动恢复状态（点击『继续推理』或按键恢复）", flush=True)
+                        print("[DEPLOY] ⏸ SpaceMouse 已停止，当前处于等待手动恢复状态（点击『恢复策略推理』或按 Alt+P 恢复）", flush=True)
             elif manual_paused:
                 active_mode = "paused"
             else:
@@ -1004,7 +1360,9 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
             executed_action: list[float] | None = None
 
             if active_mode == "paused":
-                publish_state(message=f"⏸ 已暂停推理 · 实时相机 {actual_hz:.1f} Hz（移动 SpaceMouse 可接管，或点击『继续推理』恢复）")
+                publish_state(
+                    message=f"⏸ 已暂停推理 · 实时相机 {actual_hz:.1f} Hz（移动 SpaceMouse 可接管，或点击『恢复策略推理』继续）"
+                )
                 time.sleep(0.04)
                 continue
 
@@ -1015,36 +1373,86 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                     for ax in ("x", "y", "z", "rx", "ry", "rz")
                 ] + [float(sm_action_dict.get("gripper_cmd_bin", obs["gripper_cmd_bin"]))]
                 state_doc["hil_steps"] += 1
-                publish_state(message=f"🕹️ HIL 人工接管录制中 ({actual_hz:.1f} Hz · 已录 HIL {state_doc['hil_steps']} 步)")
+                state_doc["hil_frames"] = state_doc["hil_steps"]
+                publish_state(
+                    message=f"🕹️ HIL 人工接管录制中 ({actual_hz:.1f} Hz · 已录 HIL {state_doc['hil_steps']} 步)"
+                )
 
             elif active_mode == "policy":
                 if chunk is None or chunk_idx >= open_loop_horizon:
                     req = {
-                        "observation/exterior_image_1_left": np.asarray(ext_img, dtype=np.uint8),
-                        "observation/wrist_image_left": np.asarray(wrist_img, dtype=np.uint8),
-                        "observation/state": np.asarray(state_vec, dtype=np.float32),
+                        "images": {
+                            "exterior_image": np.asarray(ext_img, dtype=np.uint8),
+                            "wrist_image": np.asarray(wrist_img, dtype=np.uint8),
+                        },
+                        "state": np.asarray(state_vec, dtype=np.float32),
                         "prompt": args.prompt,
                     }
                     resp = policy.infer(req)
                     chunk = np.asarray(resp["actions"], dtype=np.float64)
                     chunk_idx = 0
 
-                act_7d = chunk[chunk_idx]
+                act_vec = chunk[chunk_idx]
                 chunk_idx += 1
-                action_dict = {
-                    "delta_ee_pose.x": float(act_7d[0]),
-                    "delta_ee_pose.y": float(act_7d[1]),
-                    "delta_ee_pose.z": float(act_7d[2]),
-                    "delta_ee_pose.rx": float(act_7d[3]),
-                    "delta_ee_pose.ry": float(act_7d[4]),
-                    "delta_ee_pose.rz": float(act_7d[5]),
-                    "gripper_cmd_bin": 1.0 if float(act_7d[6]) >= 0.5 else 0.0,
-                }
-                robot.send_action(action_dict)
-                executed_action = [float(x) for x in act_7d[:6]] + [action_dict["gripper_cmd_bin"]]
+
+                if action_type == "absolute_joint_position_gripper_command" or len(act_vec) == 8:
+                    target_joints = np.clip(np.asarray(act_vec[:7], dtype=np.float64), joint_lower, joint_upper)
+                    gripper_bin = 1.0 if float(act_vec[7]) >= 0.5 else 0.0
+                    curr_joints = np.array([float(obs[f"joint_{i+1}.pos"]) for i in range(7)], dtype=np.float64)
+                    j_diff = target_joints - curr_joints
+                    max_j_step = 0.05
+                    num_steps = min(15, max(1, int(np.ceil(float(np.max(np.abs(j_diff))) / max_j_step))))
+                    if num_steps > 1:
+                        for s in range(1, num_steps + 1):
+                            interp_j = curr_joints + j_diff * (s / num_steps)
+                            robot._robot.robot_update_desired_joint_positions(interp_j)
+                            time.sleep(0.01)
+                    else:
+                        robot._robot.robot_update_desired_joint_positions(target_joints)
+                    robot._handle_gripper(gripper_bin, is_binary=True)
+                    executed_action = [float(x) for x in target_joints] + [gripper_bin]
+
+                elif action_type == "absolute_eef_rotvec_gripper_command":
+                    target_pos = np.asarray(act_vec[:3], dtype=np.float64)
+                    target_rotvec = np.asarray(act_vec[3:6], dtype=np.float64)
+                    gripper_bin = 1.0 if float(act_vec[6]) >= 0.5 else 0.0
+                    curr_ee = np.array([float(obs[f"ee_pose.{ax}"]) for ax in ("x", "y", "z", "rx", "ry", "rz")], dtype=np.float64)
+                    pos_diff = target_pos - curr_ee[:3]
+                    curr_rot = st.Rotation.from_rotvec(curr_ee[3:])
+                    targ_rot = st.Rotation.from_rotvec(target_rotvec)
+                    rot_diff_vec = (targ_rot * curr_rot.inv()).as_rotvec()
+                    pos_steps = max(1, int(np.ceil(float(np.linalg.norm(pos_diff)) / 0.02)))
+                    rot_steps = max(1, int(np.ceil(float(np.linalg.norm(rot_diff_vec)) / 0.1)))
+                    num_steps = min(15, max(pos_steps, rot_steps))
+                    if num_steps > 1:
+                        for s in range(1, num_steps + 1):
+                            alpha = s / num_steps
+                            interp_pos = curr_ee[:3] + pos_diff * alpha
+                            interp_rot = (st.Rotation.from_rotvec(rot_diff_vec * alpha) * curr_rot).as_rotvec()
+                            robot._robot.robot_update_desired_ee_pose(np.concatenate([interp_pos, interp_rot]))
+                            time.sleep(0.01)
+                    else:
+                        robot._robot.robot_update_desired_ee_pose(np.concatenate([target_pos, target_rotvec]))
+                    robot._handle_gripper(gripper_bin, is_binary=True)
+                    executed_action = [float(x) for x in act_vec[:6]] + [gripper_bin]
+
+                else:
+                    gripper_bin = 1.0 if float(act_vec[6]) >= 0.5 else 0.0
+                    action_dict = {
+                        "delta_ee_pose.x": float(act_vec[0]),
+                        "delta_ee_pose.y": float(act_vec[1]),
+                        "delta_ee_pose.z": float(act_vec[2]),
+                        "delta_ee_pose.rx": float(act_vec[3]),
+                        "delta_ee_pose.ry": float(act_vec[4]),
+                        "delta_ee_pose.rz": float(act_vec[5]),
+                        "gripper_cmd_bin": gripper_bin,
+                    }
+                    robot.send_action(action_dict)
+                    executed_action = [float(x) for x in act_vec[:6]] + [gripper_bin]
+
                 state_doc["policy_steps"] += 1
                 publish_state(
-                    message=f"🤖 模型自动推理中 ({actual_hz:.1f} Hz · Policy {state_doc['policy_steps']} 步 | HIL {state_doc['hil_steps']} 步)"
+                    message=f"🤖 模型自动推理中 [{action_type}] ({actual_hz:.1f} Hz · Policy {state_doc['policy_steps']} 步 | HIL {state_doc['hil_steps']} 步)"
                 )
 
             step_num = state_doc["step"]
@@ -1065,6 +1473,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                             "step": step_num,
                             "timestamp": time.time(),
                             "source": active_mode,
+                            "action_type": action_type if active_mode == "policy" else "spacemouse_delta_eef",
                             "capture_hz": actual_hz,
                             "state": state_vec,
                             "action": executed_action,
@@ -1074,6 +1483,7 @@ def cmd_hil_rollout(args: argparse.Namespace) -> int:
                     + "\n"
                 )
                 rec_steps_file.flush()
+                state_doc["recorded_frames"] = int(state_doc.get("recorded_frames", 0)) + 1
 
             state_doc["step"] = step_num + 1
             elapsed = time.perf_counter() - t0
@@ -1146,6 +1556,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument("--preview-dir", required=True)
     p_rec.add_argument("--control-file", required=True)
 
+    p_srv = sub.add_parser("serve-checkpoint")
+    p_srv.add_argument("--checkpoint", required=True)
+    p_srv.add_argument("--deploy-root", required=True)
+    p_srv.add_argument("--port", type=int, required=True)
+    p_srv.add_argument("--gpu", default="0")
+    p_srv.add_argument("--delay", type=int, default=5)
+
     p_hil = sub.add_parser("hil-rollout")
     p_hil.add_argument("--teleop-root", default="/data2/yjd/workspace/Franka-Teleop")
     p_hil.add_argument("--deploy-root", required=True)
@@ -1188,6 +1605,8 @@ def main() -> int:
         return cmd_dataset_episode_preview(args)
     if args.subcmd == "record-wrapper":
         return cmd_record_wrapper(args)
+    if args.subcmd == "serve-checkpoint":
+        return cmd_serve_checkpoint(args)
     if args.subcmd == "hil-rollout":
         return cmd_hil_rollout(args)
     return 1
