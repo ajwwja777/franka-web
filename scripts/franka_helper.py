@@ -409,7 +409,10 @@ def cmd_camera_stream(args: argparse.Namespace) -> int:
             last_jpeg_write = 0.0
             jpeg_interval = 1.0 / max(1.0, float(args.preview_fps))
 
+            stop_file = pathlib.Path(args.stop_file) if getattr(args, "stop_file", "") else None
             while not stop_flag:
+                if stop_file is not None and stop_file.exists():
+                    break
                 loop_t0 = time.perf_counter()
                 ext_frame = None
                 wrist_frame = None
@@ -1126,7 +1129,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_stream = sub.add_parser("camera-stream")
     p_stream.add_argument("--teleop-root", default="/data2/yjd/workspace/Franka-Teleop")
     p_stream.add_argument("--preview-dir", required=True)
+    p_stream.add_argument("--fps", type=int, default=30)
     p_stream.add_argument("--preview-fps", type=float, default=8.0)
+    p_stream.add_argument("--stop-file", default="")
 
     p_ds = sub.add_parser("dataset-preview")
     p_ds.add_argument("--dataset-dir", required=True)
