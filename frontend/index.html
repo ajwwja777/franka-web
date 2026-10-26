@@ -3,43 +3,45 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Franka Magic — 操作与部署工作台</title>
+  <title>Franka</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="workbench-shell">
-    <!-- ==================== 左侧：功能模块导航栏 (cobot-web 风格) ==================== -->
-    <aside class="left-sidebar">
+  <div class="workbench-shell" id="workbenchShell">
+    <!-- ==================== 左侧：功能模块导航栏 (可拖拽伸缩 + 可折叠) ==================== -->
+    <aside class="left-sidebar" id="leftSidebar">
       <div class="brand-header">
-        <div class="brand-logo">F</div>
-        <div class="brand-meta">
-          <div class="brand-title">Franka Magic</div>
-          <div class="brand-sub">FR3 操作与部署台</div>
+        <div class="brand-left">
+          <div class="brand-logo">F</div>
+          <div class="brand-title">Franka</div>
         </div>
+        <button class="icon-btn sidebar-collapse-btn" id="btnToggleSidebar" onclick="toggleDock('left')" title="收起 / 展开左侧导航">
+          ‹
+        </button>
       </div>
 
       <nav class="module-nav" id="moduleNav">
-        <button class="nav-item active" data-view="console" onclick="switchView('console')">
+        <button class="nav-item active" data-view="console" onclick="switchView('console')" title="操作台">
           <span class="nav-icon">⬡</span>
           <span class="nav-label">操作台</span>
         </button>
-        <button class="nav-item" data-view="record" onclick="switchView('record')">
+        <button class="nav-item" data-view="record" onclick="switchView('record')" title="数据采集">
           <span class="nav-icon">⏺</span>
           <span class="nav-label">数据采集</span>
         </button>
-        <button class="nav-item" data-view="deploy" onclick="switchView('deploy')">
+        <button class="nav-item" data-view="deploy" onclick="switchView('deploy')" title="部署">
           <span class="nav-icon">▶</span>
           <span class="nav-label">部署</span>
         </button>
-        <button class="nav-item" data-view="diag" onclick="switchView('diag')">
-          <span class="nav-icon"> pulse </span>
+        <button class="nav-item" data-view="diag" onclick="switchView('diag')" title="诊断分析">
+          <span class="nav-icon">◈</span>
           <span class="nav-label">诊断分析</span>
         </button>
       </nav>
 
       <div class="sidebar-spacer"></div>
 
-      <!-- 底部状态小卡片 (复刻 cobot-web 左侧边栏下部) -->
+      <!-- 底部状态小卡片 -->
       <div class="sidebar-status-card">
         <div class="sidebar-card-header">
           <span>最近操作</span>
@@ -59,29 +61,58 @@
         </div>
       </div>
 
-      <button class="sidebar-settings-btn" onclick="toggleSettingsModal()">
-        <span>⚙ 设置 (Conda / Desk 凭据)</span>
+      <button class="sidebar-settings-btn" onclick="toggleSettingsModal()" title="环境与 Desk 凭据设置">
+        <span class="nav-icon">⚙</span>
+        <span class="nav-label">设置</span>
       </button>
+
+      <!-- 左侧栏右边界拖拽分隔条 -->
+      <div class="resizer resizer-x sidebar-resizer" id="resizerSidebar" title="拖拽调整左侧栏宽度（双击还原）"></div>
     </aside>
 
-    <!-- ==================== 中上部 + 中间主工作区 ==================== -->
-    <main class="main-column">
-      <!-- ==================== 上侧：实时相机观测栏 (实时刷新 + 采集 Hz) ==================== -->
-      <section class="top-camera-dock">
-        <div class="dock-titlebar">
-          <div class="dock-title-left">
-            <span class="dock-icon">📷</span>
-            <span class="dock-title">相机</span>
-            <span class="hz-live-pill" id="camLiveHzPill">实时采集: -- Hz</span>
-            <span class="cam-source-pill" id="camSourceBadge">等待流</span>
-          </div>
-          <div class="dock-title-actions">
-            <button class="btn btn-xs btn-primary" id="btnToggleCamStream" onclick="toggleCameraStream()">开启实时相机</button>
-            <button class="btn btn-xs" onclick="runDeviceCommand('camera_snapshot')">单帧抓拍</button>
-            <button class="btn btn-xs" onclick="runDeviceCommand('preflight')">五项预检 (--check)</button>
-          </div>
+    <!-- ==================== 中间主工作列 (顶部工具条 + 可缩回相机栏 + 中间自适应操作区) ==================== -->
+    <main class="main-column" id="mainColumn">
+      <!-- 顶部 Workspace 控制条 (复刻 cobot-web 顶部栏：随时展开/缩回 相机、输出、左侧栏) -->
+      <header class="workspace-bar">
+        <div class="workspace-tools">
+          <button class="dock-pill active" id="pillToggleCamera" onclick="toggleDock('top')" title="点击缩回或展开上侧相机面板">
+            <span class="pill-icon">📷</span>
+            <span>相机</span>
+            <span class="hz-inline-tag" id="pillCameraHz">-- Hz</span>
+          </button>
+          <button class="dock-pill active" id="pillToggleOutput" onclick="toggleDock('right')" title="点击缩回或展开右侧输出面板">
+            <span class="pill-icon mono">&gt;_</span>
+            <span>输出</span>
+          </button>
         </div>
 
+        <div class="workspace-top-actions">
+          <span class="hz-live-pill" id="camLiveHzPill">实时采集: -- Hz</span>
+          <span class="cam-source-pill" id="camSourceBadge">等待流</span>
+          <button class="btn btn-xs btn-primary" id="btnToggleCamStream" onclick="toggleCameraStream()">开启实时相机</button>
+          <button class="btn btn-xs" onclick="runDeviceCommand('camera_snapshot')">单帧抓拍</button>
+          <button class="btn btn-xs" onclick="runDeviceCommand('preflight')">五项预检</button>
+        </div>
+
+        <!-- 右上角四向面板伸缩开关 (复刻 cobot-web 右上角布局按钮) -->
+        <div class="workspace-layout-btns">
+          <button class="layout-icon-btn active" id="layoutBtnLeft" onclick="toggleDock('left')" title="展开 / 缩回左侧导航">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+          </button>
+          <button class="layout-icon-btn active" id="layoutBtnTop" onclick="toggleDock('top')" title="展开 / 缩回上侧相机">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
+          </button>
+          <button class="layout-icon-btn active" id="layoutBtnRight" onclick="toggleDock('right')" title="展开 / 缩回右侧输出">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/></svg>
+          </button>
+          <button class="layout-icon-btn" onclick="resetAllDockSizes()" title="重置所有面板默认尺寸比例">
+            ↺
+          </button>
+        </div>
+      </header>
+
+      <!-- ==================== 上侧：实时相机观测栏 (可拖拽高度 + 可最大化 + 可缩回) ==================== -->
+      <section class="top-camera-dock" id="topCameraDock">
         <div class="camera-strip">
           <!-- 外部相机 -->
           <div class="cam-viewport">
@@ -110,16 +141,25 @@
               <span class="cam-bar-stats mono" id="camWristStats">-- FPS · 424×240 · -- ms</span>
             </div>
           </div>
+
+          <!-- 相机栏右上角悬浮工具：最大化 / 缩回 -->
+          <div class="cam-dock-corner-tools">
+            <button class="panel-tool-btn" onclick="toggleMaximizeDock('top')" title="最大化 / 还原相机面板">⛶</button>
+            <button class="panel-tool-btn" onclick="toggleDock('top', false)" title="缩回相机面板">✕</button>
+          </div>
         </div>
+
+        <!-- 相机栏下边界拖拽分隔条 -->
+        <div class="resizer resizer-y camera-resizer" id="resizerCamera" title="上下拖拽调整相机栏高度（双击还原）"></div>
       </section>
 
-      <!-- ==================== 中间：具体功能模块操作区 ==================== -->
-      <section class="center-workbench">
-        <!-- 视图 1：操作台 (默认视图，对齐 cobot-web 操作台) -->
+      <!-- ==================== 中间：具体功能模块操作区 (内部左右面板也可拖拽伸缩) ==================== -->
+      <section class="center-workbench" id="centerWorkbench">
+        <!-- 视图 1：操作台 -->
         <div class="workbench-view active" id="view-console">
-          <div class="console-split">
+          <div class="console-split resizable-split">
             <!-- 左半：设备拓扑与采前基本控制 -->
-            <div class="panel-box console-topology-panel">
+            <div class="panel-box split-left-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">链路拓扑与采前基本控制</span>
@@ -130,10 +170,10 @@
                 </div>
               </div>
 
-              <!-- 可视化状态拓扑图 (仿 cobot-web 中间拓扑画布) -->
+              <!-- 可视化状态拓扑图 -->
               <div class="topology-canvas">
                 <div class="topo-row">
-                  <div class="topo-node" id="topoNodeHost">
+                  <div class="topo-node ok" id="topoNodeHost">
                     <div class="topo-node-badge">HOST</div>
                     <div class="topo-node-title">Franka 工作站</div>
                     <div class="topo-node-meta mono" id="topoHostMeta">4×RTX 4090</div>
@@ -167,7 +207,7 @@
                     <div class="topo-node-meta mono" id="topoCamMeta">实时 -- Hz</div>
                   </div>
                   <div class="topo-edge active"></div>
-                  <div class="topo-node" id="topoNodeSm">
+                  <div class="topo-node ok" id="topoNodeSm">
                     <div class="topo-node-badge" id="topoBadgeSm">HIL</div>
                     <div class="topo-node-title">SpaceMouse 六维鼠</div>
                     <div class="topo-node-meta mono" id="topoSmMeta">遥操作 / HIL 介入</div>
@@ -206,8 +246,11 @@
               </div>
             </div>
 
-            <!-- 右半：机械臂状态面板 (对齐 cobot-web 右侧机械臂状态卡片) -->
-            <div class="panel-box console-arm-panel">
+            <!-- 中间操作区左右分栏拖拽条 -->
+            <div class="resizer resizer-x center-split-resizer" title="左右拖拽调整操作区两栏宽度比例（双击还原）"></div>
+
+            <!-- 右半：机械臂状态面板 -->
+            <div class="panel-box split-right-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">机械臂状态</span>
@@ -258,11 +301,10 @@
           </div>
         </div>
 
-        <!-- 视图 2：数据采集 (录制 + 可选存储路径 + 加载已有录制数据集到网页) -->
+        <!-- 视图 2：数据采集 -->
         <div class="workbench-view" id="view-record">
-          <div class="console-split">
-            <!-- 左：发起录制与 Episode 实时控制 -->
-            <div class="panel-box">
+          <div class="console-split resizable-split">
+            <div class="panel-box split-left-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">遥操作数据录制 (`franka-record`)</span>
@@ -319,8 +361,9 @@
               </div>
             </div>
 
-            <!-- 右：加载原有录制数据集到网页中预览 / 回放 -->
-            <div class="panel-box">
+            <div class="resizer resizer-x center-split-resizer" title="左右拖拽调整两栏宽度比例"></div>
+
+            <div class="panel-box split-right-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">已有录制数据集浏览与网页预览</span>
@@ -346,7 +389,6 @@
                 </table>
               </div>
 
-              <!-- 网页内数据集详情预览抽屉 -->
               <div class="dataset-preview-card" id="datasetPreviewBox" style="display:none;">
                 <div class="dp-header">
                   <strong id="dpTitle">数据集预览</strong>
@@ -364,11 +406,10 @@
           </div>
         </div>
 
-        <!-- 视图 3：部署 (预加载进 GPU + 显示 ckpt 位置 + SpaceMouse HIL 打断与录制) -->
+        <!-- 视图 3：部署 -->
         <div class="workbench-view" id="view-deploy">
-          <div class="console-split">
-            <!-- 左：部署目录、Checkpoint 路径显示、GPU 预热与启动 -->
-            <div class="panel-box">
+          <div class="console-split resizable-split">
+            <div class="panel-box split-left-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">模型部署与 GPU 预加载加速</span>
@@ -397,7 +438,6 @@
                 </div>
               </div>
 
-              <!-- 突出显示 Checkpoint 完整路径与权重状态 -->
               <div class="ckpt-highlight-box">
                 <div class="ckpt-row">
                   <span class="ckpt-label">Checkpoint 路径:</span>
@@ -430,8 +470,9 @@
               </div>
             </div>
 
-            <!-- 右：暂停/继续 + SpaceMouse HIL 打断 + 部署实时录制 -->
-            <div class="panel-box">
+            <div class="resizer resizer-x center-split-resizer" title="左右拖拽调整两栏宽度比例"></div>
+
+            <div class="panel-box split-right-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">实时干预控制 (暂停 / SpaceMouse HIL / 录制)</span>
@@ -440,7 +481,6 @@
                 <span class="mini-pill" id="rolloutModeBadge">IDLE</span>
               </div>
 
-              <!-- 实时控制大按钮 -->
               <div class="hil-live-banner" id="hilLiveBanner">
                 <div class="hil-banner-main">
                   <span class="hil-mode-tag" id="hilModeTag">IDLE</span>
@@ -511,10 +551,10 @@
           </div>
         </div>
 
-        <!-- 视图 4：诊断分析 (GPU 显存监控 + 采集前预检 + 故障恢复) -->
+        <!-- 视图 4：诊断分析 -->
         <div class="workbench-view" id="view-diag">
-          <div class="console-split">
-            <div class="panel-box">
+          <div class="console-split resizable-split">
+            <div class="panel-box split-left-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">4 × NVIDIA RTX 4090 显存与负载监控</span>
@@ -525,7 +565,9 @@
               <div class="gpu-cards-grid" id="gpuCardsGrid"></div>
             </div>
 
-            <div class="panel-box">
+            <div class="resizer resizer-x center-split-resizer" title="左右拖拽调整两栏宽度比例"></div>
+
+            <div class="panel-box split-right-pane">
               <div class="panel-box-header">
                 <div>
                   <span class="panel-box-title">一键诊断与快速恢复工具</span>
@@ -564,61 +606,45 @@
       </section>
     </main>
 
-    <!-- ==================== 右侧：输出与子系统状态栏 (复刻 cobot-web 右侧栏) ==================== -->
-    <aside class="right-output-dock">
+    <!-- ==================== 右侧：输出与子系统状态栏 (可拖拽宽度 + 可最大化 + 可缩回展开) ==================== -->
+    <aside class="right-output-dock" id="rightOutputDock">
+      <!-- 输出栏左边界拖拽分隔条 -->
+      <div class="resizer resizer-x output-resizer" id="resizerOutput" title="左右拖拽调整输出面板宽度（双击还原）"></div>
+
       <div class="dock-titlebar">
         <div class="dock-title-left">
           <span class="dock-icon mono">&gt;_</span>
           <span class="dock-title">输出</span>
         </div>
         <div class="dock-title-actions">
-          <button class="btn btn-xs btn-danger" onclick="stopAllActiveTasks()">■ 停止任务</button>
+          <button class="btn btn-xs btn-danger" onclick="stopAllActiveTasks()">■ 停止</button>
           <button class="btn btn-xs" onclick="runDeviceCommand('preflight')">诊断</button>
           <button class="btn btn-xs" onclick="clearConsoleView()">清屏</button>
+          <button class="panel-tool-btn light" onclick="toggleMaximizeDock('right')" title="最大化 / 还原输出面板">⛶</button>
+          <button class="panel-tool-btn light" onclick="toggleDock('right', false)" title="缩回输出面板">✕</button>
         </div>
       </div>
 
-      <div class="output-split-body">
+      <div class="output-split-body" id="outputSplitBody">
         <!-- 左列：子系统健康指示灯列表 -->
-        <div class="subsystem-rail">
-          <div class="subsys-item">
-            <span class="dot" id="subDotArm"></span>
-            <span class="subsys-name">机械臂</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotNuc"></span>
-            <span class="subsys-name">NUC服务</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotCam"></span>
-            <span class="subsys-name">双相机</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotDesk"></span>
-            <span class="subsys-name">Desk/FCI</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotSm"></span>
-            <span class="subsys-name">六维鼠</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotRec"></span>
-            <span class="subsys-name">数据采集</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotGpu"></span>
-            <span class="subsys-name">GPU预热</span>
-          </div>
-          <div class="subsys-item">
-            <span class="dot" id="subDotDeploy"></span>
-            <span class="subsys-name">部署推理</span>
-          </div>
+        <div class="subsystem-rail" id="subsystemRail">
+          <div class="subsys-item"><span class="dot" id="subDotArm"></span><span class="subsys-name">机械臂</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotNuc"></span><span class="subsys-name">NUC服务</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotCam"></span><span class="subsys-name">双相机</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotDesk"></span><span class="subsys-name">Desk/FCI</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotSm"></span><span class="subsys-name">六维鼠</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotRec"></span><span class="subsys-name">数据采集</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotGpu"></span><span class="subsys-name">GPU预热</span></div>
+          <div class="subsys-item"><span class="dot" id="subDotDeploy"></span><span class="subsys-name">部署推理</span></div>
         </div>
+
+        <!-- 输出栏内部左右拖拽条 -->
+        <div class="resizer resizer-x output-inner-resizer" id="resizerOutputInner" title="拖拽调整状态栏与日志区宽度"></div>
 
         <!-- 右列：实时滚动终端输出 -->
         <div class="terminal-Pane">
           <div class="terminal-header">
-            <span id="termActiveTitle">Franka Web 实时控制台输出</span>
+            <span id="termActiveTitle">实时控制台输出</span>
             <label class="auto-scroll-label"><input type="checkbox" id="chkAutoScroll" checked /> 自动滚动</label>
           </div>
           <pre class="terminal-log" id="logConsole">正在连接 Franka Web 后端...</pre>
@@ -634,7 +660,7 @@
     </aside>
   </div>
 
-  <!-- 设置弹窗 (Conda 环境路径 & Desk 免密登录凭据配置) -->
+  <!-- 设置弹窗 -->
   <div class="modal-backdrop" id="settingsModal" style="display:none;">
     <div class="modal-box">
       <div class="modal-header">

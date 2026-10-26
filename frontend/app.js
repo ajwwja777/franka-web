@@ -7,8 +7,295 @@ let recordDefaultsLoaded = false;
 let currentPreviewDataset = null;
 let clearedLogCount = 0;
 
+// ==================== Dock 伸缩与折叠状态管理 (仿 cobot-web) ====================
+const DOCK_STORAGE_KEY = "franka-web-dock-layout-v1";
+const DEFAULT_DOCK_STATE = {
+  open: { left: true, top: true, right: true },
+  maximized: null, // null | "top" | "right"
+  sizes: {
+    sidebar: 200,
+    camera: 256,
+    output: 390,
+    centerSplitPct: 54,
+    outputRail: 92,
+  },
+};
+
+let dockState = loadDockState();
+
+function loadDockState() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DOCK_STORAGE_KEY) || "{}");
+    return {
+      open: { ...DEFAULT_DOCK_STATE.open, ...(raw.open || {}) },
+      maximized: null,
+      sizes: { ...DEFAULT_DOCK_STATE.sizes, ...(raw.sizes || {}) },
+    };
+  } catch (_) {
+    return JSON.parse(JSON.stringify(DEFAULT_DOCK_STATE));
+  }
+}
+
+function saveDockState() {
+  try {
+    localStorage.setItem(DOCK_STORAGE_KEY, JSON.stringify(dockState));
+  } catch (_) {}
+}
+
+function applyDockLayout() {
+  const shell = document.getElementById("workbenchShell");
+  if (!shell) return;
+
+  const leftOpen = Boolean(dockState.open.left);
+  const topOpen = Boolean(dockState.open.top);
+  const rightOpen = Boolean(dockState.open.right);
+
+  shell.classList.toggle("left-collapsed", !leftOpen);
+  shell.classList.toggle("top-collapsed", !topOpen);
+  shell.classList.toggle("right-collapsed", !rightOpen);
+  shell.classList.toggle("top-maximized", dockState.maximized === "top" && topOpen);
+  shell.classList.toggle("right-maximized", dockState.maximized === "right" && rightOpen);
+
+  const rootStyle = document.documentElement.style;
+  rootStyle.setProperty("--sidebar-width", leftOpen ? `${Math.round(dockState.sizes.sidebar)}px` : "58px");
+  rootStyle.setProperty("--camera-height", topOpen ? `${Math.round(dockState.sizes.camera)}px` : "0px");
+  rootStyle.setProperty("--output-width", rightOpen ? `${Math.round(dockState.sizes.output)}px` : "0px");
+  rootStyle.setProperty("--center-split", `${dockState.sizes.centerSplitPct.toFixed(1)}%`);
+  rootStyle.setProperty("--output-rail-width", `${Math.round(dockState.sizes.outputRail)}px`);
+
+  // 更新按钮激活态
+  const btnSide = document.getElementById("btnToggleSidebar");
+  if (btnSide) btnSide.textContent = leftOpen ? "‹" : "›";
+
+  const pillCam = document.getElementById("pillToggleCamera");
+  if (pillCam) pillCam.classList.toggle("active", topOpen);
+
+  const pillOut = document.getElementById("pillToggleOutput");
+  if (pillOut) pillOut.classList.toggle("active", rightOpen);
+
+  const lBtnLeft = document.getElementById("layoutBtnLeft");
+  if (lBtnLeft) lBtnLeft.classList.toggle("active", leftOpen);
+
+  const lBtnTop = document.getElementById("layoutBtnTop");
+  if (lBtnTop) lBtnTop.classList.toggle("active", topOpen);
+
+  const lBtnRight = document.getElementById("layoutBtnRight");
+  if (lBtnRight) lBtnRight.classList.toggle("active", rightOpen);
+}
+
+function toggleDock(edge, forceState) {
+  if (typeof forceState === "boolean") {
+    dockState.open[edge] = forceState;
+  } else {
+    dockState.open[edge] = !dockState.open[edge];
+  }
+  if (!dockState.open[edge] && dockState.maximized === edge) {
+    dockState.maximized = null;
+  }
+  saveDockState();
+  applyDockLayout();
+}
+
+function toggleMaximizeDock(edge) {
+  if (dockState.maximized === edge) {
+    dockState.maximized = null;
+  } else {
+    dockState.open[edge] = true;
+    dockState.maximized = edge;
+  }
+  applyDockLayout();
+}
+
+function resetAllDockSizes() {
+  dockState = JSON.parse(JSON.stringify(DEFAULT_DOCK_STATE));
+  saveDockState();
+  applyDockLayout();
+}
+
+function initAllResizers() {
+  // 1) 左侧边栏宽度拖拽
+  const resSidebar = document.getElementById("resizerSidebar");
+  if (resSidebar) {
+    bindPointerResize(
+      resSidebar,
+      "x",
+      () => dockState.sizes.sidebar,
+      (val) => {
+        if (val < 110) {
+          dockState.open.left = false;
+        } else {
+          dockState.open.left = true;
+          dockState.sizes.sidebar = Math.max(150, Math.min(340, val));
+        }
+        applyDockLayout();
+      },
+      () => {
+        dockState.sizes.sidebar = DEFAULT_DOCK_STATE.sizes.sidebar;
+        dockState.open.left = true;
+        saveDockState();
+        applyDockLayout();
+      }
+    );
+  }
+
+  // 2) 上侧相机高度拖拽
+  const resCam = document.getElementById("resizerCamera");
+  if (resCam) {
+    bindPointerResize(
+      resCam,
+      "y",
+      () => dockState.sizes.camera,
+      (val) => {
+        const maxH = Math.max(220, window.innerHeight * 0.68);
+        if (val < 95) {
+          dockState.open.top = false;
+        } else {
+          dockState.open.top = true;
+          dockState.sizes.camera = Math.max(140, Math.min(maxH, val));
+        }
+        applyDockLayout();
+      },
+      () => {
+        dockState.sizes.camera = DEFAULT_DOCK_STATE.sizes.camera;
+        dockState.open.top = true;
+        saveDockState();
+        applyDockLayout();
+      }
+    );
+  }
+
+  // 3) 右侧输出宽度拖拽 (反向：向左拖变宽)
+  const resOut = document.getElementById("resizerOutput");
+  if (resOut) {
+    bindPointerResize(
+      resOut,
+      "x",
+      () => dockState.sizes.output,
+      (val) => {
+        const maxW = Math.max(300, window.innerWidth * 0.62);
+        if (val < 150) {
+          dockState.open.right = false;
+        } else {
+          dockState.open.right = true;
+          dockState.sizes.output = Math.max(240, Math.min(maxW, val));
+        }
+        applyDockLayout();
+      },
+      () => {
+        dockState.sizes.output = DEFAULT_DOCK_STATE.sizes.output;
+        dockState.open.right = true;
+        saveDockState();
+        applyDockLayout();
+      },
+      true
+    );
+  }
+
+  // 4) 输出栏内部状态轨宽度拖拽
+  const resOutInner = document.getElementById("resizerOutputInner");
+  if (resOutInner) {
+    bindPointerResize(
+      resOutInner,
+      "x",
+      () => dockState.sizes.outputRail,
+      (val) => {
+        dockState.sizes.outputRail = Math.max(68, Math.min(160, val));
+        applyDockLayout();
+      },
+      () => {
+        dockState.sizes.outputRail = DEFAULT_DOCK_STATE.sizes.outputRail;
+        saveDockState();
+        applyDockLayout();
+      }
+    );
+  }
+
+  // 5) 中间操作区左右两栏比例拖拽
+  document.querySelectorAll(".center-split-resizer").forEach((handle) => {
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add("dragging");
+      document.body.classList.add("is-resizing");
+      const container = handle.parentElement;
+      const onMove = (ev) => {
+        const rect = container.getBoundingClientRect();
+        if (rect.width <= 100) return;
+        const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+        dockState.sizes.centerSplitPct = Math.max(25, Math.min(75, pct));
+        applyDockLayout();
+      };
+      const onUp = () => {
+        handle.classList.remove("dragging");
+        document.body.classList.remove("is-resizing");
+        document.removeEventListener("pointermove", onMove, true);
+        document.removeEventListener("pointerup", onUp, true);
+        document.removeEventListener("pointercancel", onUp, true);
+        saveDockState();
+      };
+      document.addEventListener("pointermove", onMove, true);
+      document.addEventListener("pointerup", onUp, true);
+      document.addEventListener("pointercancel", onUp, true);
+    });
+    handle.addEventListener("dblclick", () => {
+      dockState.sizes.centerSplitPct = DEFAULT_DOCK_STATE.sizes.centerSplitPct;
+      saveDockState();
+      applyDockLayout();
+    });
+  });
+
+  // 6) ResizeObserver 自动监听每个面板宽度并自适应内部网格排版
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect.width;
+        entry.target.classList.toggle("is-narrow", w < 480);
+        entry.target.classList.toggle("is-very-narrow", w < 340);
+      }
+    });
+    document.querySelectorAll(".panel-box").forEach((el) => ro.observe(el));
+  }
+}
+
+function bindPointerResize(handle, axis, getStartVal, onUpdate, onReset, reverse = false) {
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("is-resizing");
+    const startCoord = axis === "x" ? e.clientX : e.clientY;
+    const startVal = getStartVal();
+
+    const onMove = (ev) => {
+      const curCoord = axis === "x" ? ev.clientX : ev.clientY;
+      const delta = (curCoord - startCoord) * (reverse ? -1 : 1);
+      onUpdate(startVal + delta);
+    };
+    const onUp = () => {
+      handle.classList.remove("dragging");
+      document.body.classList.remove("is-resizing");
+      document.removeEventListener("pointermove", onMove, true);
+      document.removeEventListener("pointerup", onUp, true);
+      document.removeEventListener("pointercancel", onUp, true);
+      saveDockState();
+    };
+    document.addEventListener("pointermove", onMove, true);
+    document.addEventListener("pointerup", onUp, true);
+    document.addEventListener("pointercancel", onUp, true);
+  });
+  if (onReset) {
+    handle.addEventListener("dblclick", onReset);
+  }
+}
+
 function switchView(viewName) {
   currentView = viewName;
+  if (dockState.maximized === "top") {
+    dockState.maximized = null;
+    applyDockLayout();
+  }
   document.querySelectorAll(".module-nav .nav-item").forEach((btn) => {
     btn.classList.toggle("active", btn.getAttribute("data-view") === viewName);
   });
@@ -55,6 +342,9 @@ function renderCameraInfo(cam) {
   const extMs = typeof cam.exterior_ms === "number" ? `${cam.exterior_ms.toFixed(1)} ms` : "-- ms";
   const wristMs = typeof cam.wrist_ms === "number" ? `${cam.wrist_ms.toFixed(1)} ms` : "-- ms";
 
+  const pillHz = document.getElementById("pillCameraHz");
+  if (pillHz) pillHz.textContent = hzStr;
+
   const hzPill = document.getElementById("camLiveHzPill");
   if (hzPill) {
     hzPill.textContent = `实时采集: ${hzStr} (目标 ${cam.target_fps || 30} Hz)`;
@@ -64,6 +354,7 @@ function renderCameraInfo(cam) {
   const srcBadge = document.getElementById("camSourceBadge");
   if (srcBadge) {
     const modeMap = {
+      live_stream: "实时流预览",
       STREAM: "实时流预览",
       RECORD: "录制实况",
       POLICY: "策略推理实况",
@@ -110,8 +401,8 @@ function renderCameraInfo(cam) {
   const topoNodeCam = document.getElementById("topoNodeCam");
   if (topoNodeCam) topoNodeCam.className = "topo-node " + (isFresh ? "ok" : "");
 
-  // 当 frame_seq 或 updated_at 变化时无闪烁刷新双相机图像
-  if (cam.ready && (seq !== lastCamSeq || cam.updated_at !== lastCamUpdatedAt) && !camImgLoading) {
+  // 当相机栏处于展开状态且 frame_seq 或 updated_at 变化时无闪烁刷新图像
+  if (dockState.open.top && cam.ready && (seq !== lastCamSeq || cam.updated_at !== lastCamUpdatedAt) && !camImgLoading) {
     lastCamSeq = seq;
     lastCamUpdatedAt = cam.updated_at;
     camImgLoading = true;
@@ -180,7 +471,6 @@ function renderAllState(data) {
   const rec = data.record || {};
   const dep = data.deploy || {};
 
-  // 1) 左侧边栏下部状态卡片
   const sideDevBadge = document.getElementById("sideDevBadge");
   const sideDevText = document.getElementById("sideDevText");
   const sideDevTime = document.getElementById("sideDevTime");
@@ -196,7 +486,6 @@ function renderAllState(data) {
     sideDevTime.textContent = `更新于 ${new Date().toLocaleTimeString()} · 探测 ${r.probe_ms || "--"} ms`;
   }
 
-  // 2) Conda 下拉框
   const condaSel = document.getElementById("condaEnvSelect");
   if (condaSel && data.config && Array.isArray(data.config.available_conda_envs)) {
     const currentVal = data.config.conda_env;
@@ -212,7 +501,6 @@ function renderAllState(data) {
     condaSel.value = currentVal;
   }
 
-  // 3) 拓扑图节点与右侧子系统指示灯
   const topoDesk = document.getElementById("topoNodeDesk");
   if (topoDesk) topoDesk.className = "topo-node " + (r.desk_tunnel_online ? "ok" : "warn");
   const topoDeskMeta = document.getElementById("topoDeskMeta");
@@ -239,7 +527,6 @@ function renderAllState(data) {
   setDot("subDotRec", rec.active ? "ok" : "");
   setDot("subDotDeploy", dep.active_rollout ? "ok" : "");
 
-  // 4) 机械臂关节与末端位姿面板
   const armReadableVal = document.getElementById("armReadableVal");
   if (armReadableVal) {
     armReadableVal.textContent = r.robot_readable ? "● 在线可读" : "○ 未就绪";
@@ -278,7 +565,6 @@ function renderAllState(data) {
     });
   }
 
-  // 5) 录制默认值与状态
   if (!recordDefaultsLoaded && rec.defaults) {
     recordDefaultsLoaded = true;
     if (rec.defaults.repo_id) document.getElementById("recRepoId").value = rec.defaults.repo_id;
@@ -300,14 +586,9 @@ function renderAllState(data) {
     }
   }
 
-  // 6) 部署目录、任务、Checkpoint 与 GPU 预热状态
   renderDeploymentSelectors(dep.deployments || []);
   renderRolloutLiveStatus(dep.active_rollout, dep.rollout_status || {}, cam);
-
-  // 7) GPU 卡片
   renderGpuCards(data.gpus || []);
-
-  // 8) 右侧终端输出日志
   renderLogs(data.logs || []);
 }
 
@@ -853,7 +1134,6 @@ async function saveSettingsModal() {
   refreshState(true);
 }
 
-// 快捷键支持：Alt+P 暂停/继续推理；录制视图下方向键控制 Episode
 window.addEventListener("keydown", (e) => {
   const tag = (e.target && e.target.tagName) || "";
   const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
@@ -879,6 +1159,8 @@ window.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("DOMContentLoaded", () => {
+  applyDockLayout();
+  initAllResizers();
   refreshState(true);
   pollCameraRealtime();
   setInterval(() => refreshState(false), 2000);
