@@ -814,6 +814,11 @@ def cmd_serve_checkpoint(args: argparse.Namespace) -> int:
     from openpi.training.config import AssetsConfig
     from expo_ft.utils.train_utils import _restore_pi05_params
 
+    import integrations.franka.realtime_expo as _re_pkg
+    ckpt_re_dir = ckpt_path / "source/integrations/franka/realtime_expo"
+    if ckpt_re_dir.is_dir() and str(ckpt_re_dir) not in _re_pkg.__path__:
+        _re_pkg.__path__.insert(0, str(ckpt_re_dir))
+
     select_rotvec_branch = None
     if config_name == "expo_pi05_franka_absolute_joint_v1_full" or action_type == "absolute_joint_position_gripper_command":
         from integrations.franka.realtime_expo.absolute_joint_v1.adapter import register_config

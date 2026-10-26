@@ -433,7 +433,7 @@ fn known_task_port_gpu(task_id: &str) -> (u16, String) {
         "green_pepper_plate_scene1" => (8129, "1".to_string()),
         "green_pepper_plate_scene2" => (8130, "2".to_string()),
         "green_block_insertion" => (8141, "3".to_string()),
-        "absolute_joint_rtc_sft_20261025" => (8142, "0".to_string()),
+        "absolute_joint_rtc_sft_20261025" => (8144, "0".to_string()),
         "absolute_eef_rtc_sft_20261025" => (8143, "1".to_string()),
         _ => (8145, "2".to_string()),
     }
@@ -2077,7 +2077,7 @@ async fn api_deploy_preload_all_handler(
     Json(json!({
         "ok": ok_count > 0,
         "results": results,
-        "message": format!("已触发 {} 个模型的并行 GPU 预加载（Joint step_5550 @ GPU0:8142 + EEF step_5500 @ GPU1:8143），全部就绪后可直接切换秒开部署！", ok_count),
+        "message": format!("已触发 {} 个模型的并行 GPU 预加载（Joint step_5550 @ GPU0:8144 + EEF step_5500 @ GPU1:8143），全部就绪后可直接切换秒开部署！", ok_count),
     }))
 }
 
@@ -2627,7 +2627,7 @@ mod tests {
     #[test]
     fn test_known_task_port_gpu() {
         assert_eq!(known_task_port_gpu("green_block_insertion"), (8141, "3".to_string()));
-        assert_eq!(known_task_port_gpu("absolute_joint_rtc_sft_20261025"), (8142, "0".to_string()));
+        assert_eq!(known_task_port_gpu("absolute_joint_rtc_sft_20261025"), (8144, "0".to_string()));
         assert_eq!(known_task_port_gpu("absolute_eef_rtc_sft_20261025"), (8143, "1".to_string()));
         assert_eq!(known_task_port_gpu("in_the_pot"), (8128, "3".to_string()));
         assert_eq!(known_task_port_gpu("book_shelf"), (8127, "2".to_string()));
